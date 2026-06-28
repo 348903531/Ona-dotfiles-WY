@@ -1,0 +1,12 @@
+# Never commit secrets or local-only artifacts into dotfiles.
+*.local
+*.local.*
+.env
+.env.*
+*token*
+*secret*
+*credential*
+*.pem
+*.key
+id_rsa*
+google_token.json
