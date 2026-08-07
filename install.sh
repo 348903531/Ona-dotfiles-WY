@@ -124,6 +124,18 @@ if [ -f "$DOTFILES_DIR/vscode/install_extensions.sh" ]; then
 fi
 
 # ---------------------------------------------------------------------------
+# 3c. 窗口标题栏带上当前 Ona 环境名（vscode/set_window_title.sh）
+#
+# 多窗口时任务栏里各个 VS Code 长得一样，分不清哪个是哪个环境。标题栏写上环境名
+# 就能一眼认出。为什么不直接写进 User 设置：那层不怕重建，但环境名只能写死，
+# 在别的环境里会顶着错名字。本脚本每次现查一次再写，两个问题一起解决。
+# fail-soft：拿不到名字就退化成不带环境名的模板，不阻塞启动。
+# ---------------------------------------------------------------------------
+if [ -f "$DOTFILES_DIR/vscode/set_window_title.sh" ]; then
+  bash "$DOTFILES_DIR/vscode/set_window_title.sh" || log "window title skipped (non-fatal)"
+fi
+
+# ---------------------------------------------------------------------------
 # 4. Git convenience config (safe, non-secret, global)
 # ---------------------------------------------------------------------------
 git config --global pull.ff only 2>/dev/null || true

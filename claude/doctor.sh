@@ -123,6 +123,13 @@ if [ -f "$LIST" ]; then
 else
   warn "没有 $LIST，扩展装配未声明化（换环境要手装）"
 fi
+if [ -f "$DOT/vscode/set_window_title.sh" ]; then
+  if bash "$DOT/vscode/set_window_title.sh" --check >/dev/null 2>&1; then
+    ok "标题栏环境名：两侧 server 都是当前环境的名字"
+  else
+    bad "标题栏环境名没写全（某侧缺 / 名字过期）" "bash ~/dotfiles/vscode/set_window_title.sh"
+  fi
+fi
 
 # ── 6. 只能你自己在本地 VS Code 里确认的（容器内看不到）──────────────────
 head_ "6) 容器内查不到的两项（存在你本地电脑上）"
