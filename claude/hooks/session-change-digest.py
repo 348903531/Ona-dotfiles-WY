@@ -69,6 +69,7 @@ if _proj and _os.path.isfile(
         _os.path.join(_proj, ".claude", "hooks", _os.path.basename(__file__))):
     _sys.exit(0)          # 项目级已装同名 hook → 让它来，避免同一件事报两遍
 
+import ast
 import json
 import os
 import re
@@ -147,6 +148,80 @@ SCRIPT_WRITE_RE = re.compile(
     r"|\.to_csv\s*\(|\.to_excel\s*\(|\.to_json\s*\(|\.savefig\s*\("
     r"|\bfs\.writeFile|\bwriteFileSync"                       # node
 )
+
+
+# ── python 写文件：用 AST 真解析，不用正则 ────────────────────────────────────
+# 第五种误报形态（2026-08-07，本 hook 又一次自曝）：一条**只读**的验证脚本被记成
+# 「脚本内写了文件」——因为它的**测试用例字符串**里含 `io.open(p,"w").write(...)`。
+# 那是数据，不是要执行的代码。
+#
+# 前四种形态（heredoc 正文 / echo 参数 / 注释 / 变量赋值）都靠"先切出真正会执行的
+# 片段"解决；这一种切不掉——写法就在 python 代码内部，只是位于字符串字面量里。
+# 再加第六个正则只会再漏第七种。**换方法**：python 代码交给 `ast` 真解析，
+# 字符串字面量是 `ast.Constant`、永远不会变成 `ast.Call`，天然排除。
+# （同一条教训的第二次应用：destructive-command-guard 早先也是从正则换成 shlex。）
+#
+# 退化路径：`ast.parse` 失败（不是 python、片段不完整、bash/node 脚本）→ 退回正则。
+# 宁可对非 python 保留一点误报，也不放过真的写文件——账本漏记比多记糟。
+_WRITE_MODE_RE = re.compile(r"[wax]")
+_WRITE_ATTRS = {
+    "write", "writelines", "write_text", "write_bytes", "writerow", "writerows",
+    "to_csv", "to_excel", "to_json", "to_parquet", "savefig", "savez", "dump",
+    "replace", "rename", "remove", "unlink", "mkdir", "makedirs", "rmtree",
+    "copy", "copy2", "copyfile", "copytree", "move", "save",
+}
+_WRITE_FUNCS = {"open"}          # 裸 open(...) 需再看 mode
+_SAFE_DUMP_OWNERS = {"json", "yaml", "pickle", "toml", "shutil", "os", "np", "numpy"}
+
+
+def _extract_script_source(cmd):
+    """从命令里取出「要执行的脚本正文」：heredoc 正文，或 -c/-e 的参数。取不到返回 None。"""
+    m = HEREDOC_RE.search(cmd)
+    if m:
+        body = m.group(0)
+        # 去掉首行 `<<'PY'` 与末行终止符，剩下即正文
+        lines = body.splitlines()
+        if len(lines) >= 2:
+            return "\n".join(lines[1:-1])
+    m2 = re.search(r"-c\s+(['\"])(?P<code>.+?)\1", cmd, re.S)
+    if m2:
+        return m2.group("code")
+    return None
+
+
+def _python_writes_file(src):
+    """AST 判定：这段 python 代码里有没有**真的调用**写文件。解析失败返回 None。"""
+    try:
+        tree = ast.parse(src)
+    except (SyntaxError, ValueError):
+        return None                       # 交给调用方退回正则
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        f = node.func
+        if isinstance(f, ast.Name) and f.id in _WRITE_FUNCS:
+            # open(path, "w") —— 只有带写模式才算
+            for a in list(node.args[1:2]) + [k.value for k in node.keywords
+                                             if k.arg == "mode"]:
+                if isinstance(a, ast.Constant) and isinstance(a.value, str) \
+                        and _WRITE_MODE_RE.search(a.value):
+                    return True
+        elif isinstance(f, ast.Attribute) and f.attr in _WRITE_ATTRS:
+            # `.dump(` 只在 json/yaml/pickle 这类下算写盘；`d.dump()` 之外的自定义对象
+            # 也放行——宁可多记一条，不漏记。
+            return True
+    return False
+
+
+def _script_writes_file(cmd, head):
+    """段首是 python 时优先 AST；其余（bash/node/perl…）或解析失败时退回正则。"""
+    if head in ("python", "python3"):
+        src = _extract_script_source(cmd)
+        if src is not None:
+            verdict = _python_writes_file(src)
+            if verdict is not None:
+                return verdict            # AST 说了算，字符串字面量不会误伤
+    return bool(SCRIPT_WRITE_RE.search(cmd))
 
 
 def _command_units(cmd):
@@ -251,8 +326,9 @@ def _classify(cmd):
                 hits.add("upload")
             if SEND_RE.search(joined):
                 hits.add("send")
-            # 脚本内写文件：**必须看未剥离的原文**（见下方 SCRIPT_WRITE_RE 的说明）
-            if SCRIPT_WRITE_RE.search(cmd):
+            # 脚本内写文件：**必须看未剥离的原文**（见 SCRIPT_WRITE_RE 的说明）。
+            # python 走 AST 真解析，解析不了才退回正则（见 _python_writes_file）。
+            if _script_writes_file(cmd, head):
                 hits.add("script_write")
         if UPLOAD_RE.search(joined) and head in ("gws", "rclone", "gsutil", "aws"):
             hits.add("upload")
@@ -530,6 +606,25 @@ def _selftest():
         fh.write(rec("Bash", {"command": 'echo "开始清理" && rm -rf /workspaces/x'}) + "\n")
     data6, _ = collect(path6, 0)
     want("破坏性" in render(data6), "别修过头：安全段之后的真危险操作仍要记账")
+
+    # bug1d：AST 判定——字符串字面量里的写文件写法不算数（本轮第五种误报形态）
+    _ast_cases = [
+        (False, "只读脚本，写法在用例字符串里",
+         "python3 - <<'PY'\ncases = [(\"a\", \"io.open('c.json','w').write('x')\")]\n"
+         "for n, c in cases:\n    print(n, c)\nPY"),
+        (False, "只读：json.load + print",
+         "python3 - <<'PY'\nimport json, io\nprint(json.load(io.open('c.json')))\nPY"),
+        (False, "只读：open 不带模式",
+         "python3 - <<'PY'\nprint(open('a.txt').read())\nPY"),
+        (True, "真写：io.open(...,'w').write",
+         "python3 - <<'PY'\nimport io\nio.open('c.json','w').write('{}')\nPY"),
+        (True, "真写：open(mode='a') 关键字形式",
+         "python3 - <<'PY'\nf = open('log.txt', mode='a')\nf.write('x')\nPY"),
+        (True, "非 python 退回正则：node writeFileSync",
+         "node -e \"require('fs').writeFileSync('a.txt','x')\""),
+    ]
+    for _want, _name, _cmd in _ast_cases:
+        want(("script_write" in _classify(_cmd)) == _want, "bug1d AST：" + _name)
 
     # bug1c（用户当场点出的账本盲区）：脚本内写文件必须记账
     # 真实命令：python3 heredoc 里改写 VS Code settings.json，此前只记到同条命令的 cp
