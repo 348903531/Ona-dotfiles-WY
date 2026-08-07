@@ -152,6 +152,32 @@ def _command_units(cmd):
     return out
 
 
+# ── destructive 判定：**直接复用 destructive-command-guard**，不自己写第二套 ──────
+# 为什么（2026-08-07 本 hook 自己的清单抓到的第四个误报）：两处各写一套 git/rm 规则，
+# 必然漂移。实证：`rm -rf claude/hooks/__pycache__` 在 guard 那边命中安全区豁免、**不弹窗**，
+# 在这边却被记成「⚠️ 破坏性操作」——同一条命令两个结论，清单因此把「删缓存目录」这种日常
+# 动作报成危险，稀释了 ⚠️ 的信号价值。
+# 判据只有一个来源：guard 的 _scan()。它已内含 heredoc 剥离、文本段跳过、rm 安全区豁免，
+# 这边全部自动继承，以后改一处两处都对。加载失败则退回「不标 destructive」——记账少标一个
+# 标记是可接受的降级，绝不因此崩掉整份清单。
+def _load_destructive_scan():
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                        "destructive-command-guard.py")
+    if not os.path.isfile(path):
+        return None
+    try:
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("_dcg_for_digest", path)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return getattr(mod, "_scan", None)
+    except Exception:
+        return None
+
+
+_DESTRUCTIVE_SCAN = _load_destructive_scan()
+
+
 def _git_sub(args):
     i = 0
     while i < len(args):
@@ -178,28 +204,16 @@ def _classify(cmd):
         if head == "git":
             sub, rest = _git_sub(args)
             rs = set(rest)
+            # 只做「记账分类」；危险与否统一由 _DESTRUCTIVE_SCAN 判（见文件上方说明）
             if sub == "commit":
                 hits.add("commit")
             elif sub == "push":
                 hits.add("push")
-                if {"--force", "-f", "--force-with-lease"} & rs:
-                    hits.add("destructive")
-            elif sub == "reset" and "--hard" in rs:
-                hits.add("destructive")
-            elif sub == "clean" and not ({"-n", "--dry-run"} & rs) and any(
-                    a.startswith("-") and "f" in a.lstrip("-") for a in rest):
-                hits.add("destructive")
-            elif sub == "stash" and rest and rest[0] in ("drop", "clear"):
-                hits.add("destructive")
-            elif sub == "branch" and "-D" in rs:
-                hits.add("destructive")
         elif head == "gh" and args and args[0] == "pr" and len(args) > 1 and args[1] in (
                 "create", "merge", "edit", "close", "comment"):
             hits.add("pr")
         elif head == "rm":
-            hits.add("rm")
-            if any(a.startswith("-") and "r" in a.lstrip("-").lower() for a in args):
-                hits.add("destructive")
+            hits.add("rm")            # 危险与否由 _DESTRUCTIVE_SCAN 统一判
         elif head in ("mv", "cp") and len(args) >= 2:
             hits.add("move")
         elif head in CODE_ARG_HEADS:
@@ -210,6 +224,13 @@ def _classify(cmd):
                 hits.add("send")
         if UPLOAD_RE.search(joined) and head in ("gws", "rclone", "gsutil", "aws"):
             hits.add("upload")
+    # 破坏性：单一事实源（含安全区豁免），与弹窗闸门永远同一结论
+    if _DESTRUCTIVE_SCAN:
+        try:
+            if _DESTRUCTIVE_SCAN(cmd):
+                hits.add("destructive")
+        except Exception:
+            pass
     return hits
 
 
@@ -476,6 +497,20 @@ def _selftest():
         fh.write(rec("Bash", {"command": 'echo "开始清理" && rm -rf /workspaces/x'}) + "\n")
     data6, _ = collect(path6, 0)
     want("破坏性" in render(data6), "别修过头：安全段之后的真危险操作仍要记账")
+
+    # bug1c（第四轮，本 hook 的清单又抓到自己）：destructive 判据必须与弹窗闸门一致。
+    # 曾经两处各写一套 git/rm 规则 → `rm -rf .../__pycache__` 在 guard 那边命中安全区
+    # 豁免、不弹窗，在这边却被记成「⚠️ 破坏性操作」。同一条命令两个结论 = 判据漂移。
+    for _cmd, _want, _why in [
+        ("rm -rf claude/hooks/__pycache__", False, "安全区：删缓存目录不算破坏性"),
+        ("rm -rf /tmp/build", False, "安全区：临时目录"),
+        ("git reset -q HEAD p || git rm -r --cached -q p", False, "只动索引不碰工作区"),
+        ("rm -rf /workspaces/proj/out", True, "工作区目录，回不去"),
+        ("git reset --hard", True, "丢未提交改动"),
+        ("git push --force origin main", True, "覆盖远端历史"),
+    ]:
+        want(("destructive" in _classify(_cmd)) == _want,
+             "bug1c 判据一致：%s（%s）" % (_cmd[:38], _why))
 
     # bug1c（第三轮）：真实误报形态——命令位置解析后才根治
     fd7, path7 = tempfile.mkstemp(suffix=".jsonl")
