@@ -119,6 +119,14 @@ Ona账户里要填dotfiles仓库地址)。
 ## Git习惯
 
 - 开新分支前先把main拉到最新；提PR前再rebase一次，不在过期main上长期开发。
+- **往「已开PR的分支」追加commit前，先查一次PR还开着没**
+  (`gh api repos/<o>/<r>/pulls/<n> --jq .state`)。PR可能在你干活期间**被别人、或被你
+  自己在另一个窗口点了合并**——squash合并后再往那个分支推，commit就成了stranded、
+  永远进不了main,而 `git push` 照样成功、不报任何错。发现推错了：从最新main开新分支
+  → `git cherry-pick <sha>` → 重开PR。2026-08-07实测踩到：PR合并于15:51,我的第二个
+  commit推于15:56,`gh pr view` 只显示1个commit才露馅。
+- **别信 `gh pr view` 的缓存，回到实物**:`git ls-remote origin <分支>` 看远端真实sha、
+  `gh api .../pulls/<n> --jq .head.sha` 看PR真实head。两者对不上就是出事了。
 - 未经明确要求**不主动commit / push**。
 - commit时加co-author:`Co-authored-by: Ona <no-reply@ona.com>`。
 
