@@ -39,8 +39,28 @@
 - agent行为/偏好/纪律 → 本文件(`~/dotfiles/claude/CLAUDE.md`,已软链到 `~/.claude/CLAUDE.md`)
 - Claude用户级设置(权限ask规则、用户级hook) → `~/dotfiles/claude/` + `install.sh` 装
 - shell别名/环境 → `~/dotfiles/shell/`
-- VS Code设置 → **User** 标签页(存本地机器),**不是** Remote(存容器，重建即丢)
+- VS Code设置 → 见下面「层④有两个子形态」,别一律往User塞、也别一律往dotfiles塞
 - 改完dotfiles **必须commit + push**,否则新环境clone不到 = 白改
+
+**层④有两个子形态，选错会造成「改了不生效」**(2026-08-07实测定下):
+
+| 这个设置的值 | 落点 | 例子 |
+|---|---|---|
+| **跟环境走**(每个环境不一样) | dotfiles脚本**现查现写**进容器Machine层 | 环境名、区域、容器内路径 |
+| **跟人走**(到哪都一样的静态偏好) | VS Code **User** 标签页(存本地机器) | 主题、键位、右侧栏默认、`claudeCode.*` |
+
+**判据一句话：这个值换个环境会不会变？** 会变 → dotfiles脚本(写死在User里必然在别的
+环境顶着错名字);不变 → User层。**两个方向都别推广过头**:
+- 静态偏好**别**搬dotfiles——① dotfiles**只在Ona环境跑**,你在本机开个文件夹、连非Ona
+  远程时它根本不执行，那儿就没你的偏好；② 它写的是**Machine层、优先级高于User**,
+  每写一个键就永久造一个覆盖层，以后在User改同一个键会「改了不生效」、极难排查。
+- 动态值**别**写死User——换个环境就是错的。
+- 同一个键**绝不两层各留一份**:Machine恒压User,留在User那份是永不生效的死设置。
+- 写容器Machine层时**两个server目录都要写**:`~/.vscode-server/data/Machine/` (桌面Remote)
+  与 `~/.vscode-browser-server/data/Machine/` (Ona网页版),只写一侧从另一侧连进来就没有。
+  扩展安装同理(`vscode/install_extensions.sh`)——同一个坑已踩两次。
+- **`claudeCode.allowDangerouslySkipPermissions` 这类权限总开关只能用户自己在User层开**:
+  agent写它 = 自我授权，Claude Code安全分类器硬拒，别去碰。
 
 **交付时必须说清作用域**:每次汇报改动，写明这条是「跨项目通用」还是「只对本项目」。
 用户看不到落点，只能靠你说。
