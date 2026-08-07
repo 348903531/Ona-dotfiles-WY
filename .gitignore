@@ -10,3 +10,7 @@
 *.key
 id_rsa*
 google_token.json
+
+# Python 产物（sync-hooks.sh 跑 py_compile 会生成）
+__pycache__/
+*.pyc

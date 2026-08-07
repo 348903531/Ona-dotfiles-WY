@@ -67,7 +67,42 @@ if [ -f "$DOTFILES_DIR/shell/aliases.sh" ]; then
 fi
 
 # ---------------------------------------------------------------------------
-# 3. Git convenience config (safe, non-secret, global)
+# 3. Claude Code 权限安全网（用户级 → 对**每一个**项目生效）
+#
+# 背景（2026-08-07 用户要求）：技术执行类的 bash / edit 确认弹窗，正文是原始 shell 与
+# diff，用户看不懂、每次只会点 yes——弹与不弹结果一样，只多一次打断。于是把总开关切到
+# Bypass permissions（VS Code User 设置，跨项目跨容器）。**但放开确认权就必须补上安全网**，
+# 否则是净损失：不弹窗 = 不知道 agent 干了什么。
+#
+# 三层，全部装在用户级，因此换项目、换容器都还在：
+#   ① permissions.ask —— 20 条不可逆操作。官方明文保证 explicit ask rules 在
+#      bypassPermissions 下**仍然强制弹窗**，是唯一有明文保证的确定层。
+#   ② destructive-command-guard —— 危险命令弹窗正文换成**中文人话**（治「看不懂」）。
+#   ③ session-change-digest —— 会话收尾**自动打印本轮改动清单**，把「逐次事前确认」
+#      换成「一次性事后对账」。
+#
+# 注意：agent **不能**替用户开 Bypass 模式（Claude Code 安全分类器判为自我授权并硬拒，
+# 且明文「用户同意也不解除」）。总开关必须用户自己在 VS Code 设置里切；这里只装安全网。
+#
+# 合并而非软链：~/.claude/settings.json 里有本机独有且含 PII 的 env（内网代理地址、
+# 邮箱、user id），软链会把它整个换掉。merge_settings.py 只写声明过的键，幂等、
+# 写前备份、原子替换，目标损坏时宁可报错也不覆盖。
+# ---------------------------------------------------------------------------
+if [ -d "$DOTFILES_DIR/claude/hooks" ]; then
+  mkdir -p "$HOME/.claude/hooks"
+  for hook in "$DOTFILES_DIR"/claude/hooks/*.py; do
+    [ -e "$hook" ] || continue
+    ln -sfn "$hook" "$HOME/.claude/hooks/$(basename "$hook")"
+  done
+  log "linked user-level Claude hooks -> dotfiles"
+fi
+if [ -f "$DOTFILES_DIR/claude/merge_settings.py" ]; then
+  # 失败绝不中断环境启动：安全网装不上顶多回到「照常弹窗」，那是安全的失败方向。
+  python3 "$DOTFILES_DIR/claude/merge_settings.py" || log "merge_settings skipped (non-fatal)"
+fi
+
+# ---------------------------------------------------------------------------
+# 4. Git convenience config (safe, non-secret, global)
 # ---------------------------------------------------------------------------
 git config --global pull.ff only 2>/dev/null || true
 git config --global init.defaultBranch main 2>/dev/null || true
@@ -75,7 +110,7 @@ git config --global push.autoSetupRemote true 2>/dev/null || true
 log "applied global git conveniences"
 
 # ---------------------------------------------------------------------------
-# 4. Optional CLI tools (commented out by default — keep startup fast).
+# 5. Optional CLI tools (commented out by default — keep startup fast).
 #    Uncomment selectively if you decide you want them. Each block checks first
 #    so re-runs are cheap, and failures never abort startup.
 # ---------------------------------------------------------------------------
