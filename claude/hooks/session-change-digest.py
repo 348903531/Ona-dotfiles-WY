@@ -89,6 +89,7 @@ ACTION_LABELS = [
     ("send", "外发（邮件/chat）"),
     ("rm", "删除文件"),
     ("move", "移动/复制文件"),
+    ("script_write", "脚本内写了文件"),
 ]
 UPLOAD_RE = re.compile(
     r"MediaFileUpload|files\(\)\.create\(|files\(\)\.update\(|drive[_-]?upload|\bupload\b")
@@ -118,6 +119,34 @@ def _strip_heredocs(cmd):
 SEPARATORS = {"&&", "||", ";", "|", "&", "(", ")", "{", "}"}
 CODE_ARG_HEADS = {"python", "python3", "bash", "sh", "node", "perl", "ruby", "eval"}
 WRAPPERS = ("sudo", "time", "nice", "nohup", "command", "timeout")
+
+# ── 脚本内写文件：账本最后一个大盲区（2026-08-07 用户当场点出）────────────────
+# 症状：agent 用 `python3 - <<'PY' … io.open(p,"w").write(…) … PY` 改了一个配置文件，
+# 清单只记到同一条命令里的 `cp 备份`，**改写本身完全看不见**。用户按清单复核就会漏掉
+# 一个实质改动——账本是「放弃逐次确认」的代偿，账本漏记等于代偿失效。
+#
+# 根因不是「没写这条规则」，而是**heredoc 正文被剥离了**：`_strip_heredocs` 是为了防
+# 危险命令误报（heredoc 里的文档文字含 "rm -rf /" 被当真命令）才加的，却把代码内容
+# 一起挡在了外面。所以这里刻意用**未剥离的 cmd 原文**扫，而不是剥离后的版本——
+# 两个需求对 heredoc 的要求正好相反：
+#   · 危险命令判定 → 必须剥离（正文是数据，不是要执行的 shell）
+#   · 脚本写文件判定 → 必须保留（正文正是要执行的代码，写文件就藏在里面）
+#
+# 只在段首命令是 CODE_ARG_HEADS（python/bash/node…）时才扫——「参数即代码」的前提下
+# 文本匹配才有意义；否则 grep 一个含 `.write(` 的字符串也会中招。
+#
+# 诚实边界：这是**文本级近似**，与 upload/send 同档。命中只代表「这段代码里出现了写
+# 文件的写法」，不保证真写了（可能在注释里、可能是 dry-run 分支没走到）。所以标签写
+# 「脚本内写了文件」而非断言路径——路径在代码里千变万化，硬提取必然出错，宁可只提示
+# 「这条命令动过文件，去看它」，把判断留给人。
+SCRIPT_WRITE_RE = re.compile(
+    r"open\s*\([^)]{0,200}?['\"][waxr]?\+?[wax]\+?b?['\"]"   # open(p,"w") / io.open(p,'a')
+    r"|\.write\s*\(|\.writelines\s*\(|\.write_text\s*\(|\.write_bytes\s*\("
+    r"|json\.dump\s*\(|yaml\.(?:safe_)?dump\s*\(|pickle\.dump\s*\("
+    r"|shutil\.(?:copy\w*|move)\s*\(|os\.(?:replace|rename|remove|unlink)\s*\("
+    r"|\.to_csv\s*\(|\.to_excel\s*\(|\.to_json\s*\(|\.savefig\s*\("
+    r"|\bfs\.writeFile|\bwriteFileSync"                       # node
+)
 
 
 def _command_units(cmd):
@@ -222,6 +251,9 @@ def _classify(cmd):
                 hits.add("upload")
             if SEND_RE.search(joined):
                 hits.add("send")
+            # 脚本内写文件：**必须看未剥离的原文**（见下方 SCRIPT_WRITE_RE 的说明）
+            if SCRIPT_WRITE_RE.search(cmd):
+                hits.add("script_write")
         if UPLOAD_RE.search(joined) and head in ("gws", "rclone", "gsutil", "aws"):
             hits.add("upload")
     # 破坏性：单一事实源（含安全区豁免），与弹窗闸门永远同一结论
@@ -349,7 +381,8 @@ def render(data):
     if files:
         lines.append("· 改了 %d 个文件：%s" % (len(files), _fmt_paths(files)))
     # 破坏性操作放最前，其余按固定顺序
-    order = ["destructive", "commit", "push", "pr", "upload", "send", "rm", "move"]
+    order = ["destructive", "commit", "push", "pr", "upload", "send", "rm", "move",
+             "script_write"]
     for key in order:
         b = actions.get(key)
         if not b:
@@ -497,6 +530,43 @@ def _selftest():
         fh.write(rec("Bash", {"command": 'echo "开始清理" && rm -rf /workspaces/x'}) + "\n")
     data6, _ = collect(path6, 0)
     want("破坏性" in render(data6), "别修过头：安全段之后的真危险操作仍要记账")
+
+    # bug1c（用户当场点出的账本盲区）：脚本内写文件必须记账
+    # 真实命令：python3 heredoc 里改写 VS Code settings.json，此前只记到同条命令的 cp
+    fd7, path7 = tempfile.mkstemp(suffix=".jsonl")
+    real_cmd = (
+        'P=/home/vscode/.vscode-server/data/Machine/settings.json\n'
+        'cp "$P" /tmp/x.bak.json\n'
+        "python3 - \"$P\" <<'PYEOF'\n"
+        'import json, io, sys\n'
+        'd = json.load(io.open(sys.argv[1], encoding="utf-8"))\n'
+        'io.open(sys.argv[1], "w", encoding="utf-8").write(json.dumps(d))\n'
+        'PYEOF'
+    )
+    with os.fdopen(fd7, "w", encoding="utf-8") as fh:
+        fh.write(rec("Bash", {"command": real_cmd}) + "\n")
+    data7, _ = collect(path7, 0)
+    out7 = render(data7)
+    want("脚本内写了文件" in out7,
+         "bug1c 回归：heredoc 里的 io.open(...,'w') 被记账（此前完全看不见）")
+    want("移动/复制文件" in out7, "同条命令里的 cp 仍然记得到（没被顶掉）")
+
+    # 别修过头：只读脚本不该被记成写文件
+    fd8, path8 = tempfile.mkstemp(suffix=".jsonl")
+    with os.fdopen(fd8, "w", encoding="utf-8") as fh:
+        fh.write("\n".join([
+            rec("Bash", {"command": 'python3 -c "import json;print(json.load(open(\'a.json\')))"'}),
+            rec("Bash", {"command": "python3 - <<'PY'\nimport sys\nprint(sys.version)\nPY"}),
+            rec("Bash", {"command": 'grep -rn ".write(" src/'}),
+        ]) + "\n")
+    data8, _ = collect(path8, 0)
+    want(render(data8) == "",
+         "别修过头：只读脚本 / grep 里出现 .write( 都不记账")
+    for _p in (path7, path8):
+        try:
+            os.unlink(_p)
+        except Exception:
+            pass
 
     # bug1c（第四轮，本 hook 的清单又抓到自己）：destructive 判据必须与弹窗闸门一致。
     # 曾经两处各写一套 git/rm 规则 → `rm -rf .../__pycache__` 在 guard 那边命中安全区
