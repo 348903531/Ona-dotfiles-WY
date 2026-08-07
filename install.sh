@@ -96,9 +96,31 @@ if [ -d "$DOTFILES_DIR/claude/hooks" ]; then
   done
   log "linked user-level Claude hooks -> dotfiles"
 fi
+# 3a. 先止血，再合并。
+#
+# 镜像自带的 /usr/local/bin/welcome-claude.sh 被 ~/.bashrc 无条件 source，它会用
+# `jq ... > ~/.claude/settings.json` **整文件覆盖**掉我们下面合并进去的一切
+# （2026-08-07 实测：同一天被清空至少三次，permissions/hooks 全部蒸发）。
+# 所以顺序必须是「先把覆盖改成合并，再写入」，否则写了也白写。
+# 补丁幂等、写前备份、bash -n 校验后才装、无 sudo 则 SKIP —— 全程 fail-soft。
+if [ -f "$DOTFILES_DIR/claude/patch_welcome_claude.sh" ]; then
+  bash "$DOTFILES_DIR/claude/patch_welcome_claude.sh" || log "welcome-claude patch skipped (non-fatal)"
+fi
 if [ -f "$DOTFILES_DIR/claude/merge_settings.py" ]; then
   # 失败绝不中断环境启动：安全网装不上顶多回到「照常弹窗」，那是安全的失败方向。
   python3 "$DOTFILES_DIR/claude/merge_settings.py" || log "merge_settings skipped (non-fatal)"
+fi
+
+# ---------------------------------------------------------------------------
+# 3b. 跨项目 VS Code 扩展（vscode/extensions.txt）
+#
+# 为什么在这儿而不是各项目的 devcontainer.json：那是项目级，换个仓库就没了。
+# 这里装的是「不管打开哪个项目我都想要」的那几个。两侧 server 都装——只装一侧
+# 的话从另一侧连进来什么都看不到（实测：github PR 扩展只在网页版侧有）。
+# fail-soft：装不上不影响环境启动。
+# ---------------------------------------------------------------------------
+if [ -f "$DOTFILES_DIR/vscode/install_extensions.sh" ]; then
+  bash "$DOTFILES_DIR/vscode/install_extensions.sh" || log "vscode extensions skipped (non-fatal)"
 fi
 
 # ---------------------------------------------------------------------------

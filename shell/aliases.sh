@@ -44,6 +44,27 @@ dotfiles-sync() {
   )
 }
 
+# --- Claude 用户级安全网自愈（第二层兜底）-------------------------------------
+# 第一层是 claude/patch_welcome_claude.sh：把镜像自带 welcome-claude.sh 的
+# 「整文件覆盖 ~/.claude/settings.json」改成「合并」，从源头止血。
+# 但那层依赖 ①有免密 sudo ②镜像那行写法没变。这里是**不依赖任何一条**的兜底：
+# ~/.bashrc 里 dotfiles 这段 source 排在 `source welcome-claude.sh` 之后，
+# 所以只要开过一个新 shell，被清掉的 permissions/hooks 就会被补回来。
+#
+# 造价刻意压到近乎为零：只做一次 grep，**没被清空就什么都不干**（不起 python）。
+# 全程 fail-soft，任何异常都静默——shell 启动绝不能因为它变慢或报错。
+_ona_claude_settings_heal() {
+  local f="$HOME/.claude/settings.json"
+  local m="$HOME/dotfiles/claude/merge_settings.py"
+  [ -f "$f" ] && [ -f "$m" ] || return 0
+  grep -q '"permissions"' "$f" 2>/dev/null && return 0   # 还活着，走人
+  python3 "$m" >/dev/null 2>&1 || true
+}
+_ona_claude_settings_heal
+
+# 一键体检：装过 ≠ 现在还活着（见 claude/doctor.sh）
+alias dotfiles-doctor='bash "$HOME/dotfiles/claude/doctor.sh"'
+
 # --- navigation ---
 alias ll='ls -alh'
 alias ..='cd ..'

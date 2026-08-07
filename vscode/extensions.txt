@@ -1,0 +1,32 @@
+# 跨项目VS Code扩展清单（marketplace id，一行一个；# 开头是注释）
+#
+# 为什么放这儿而不是某个项目的devcontainer.json：
+#   devcontainer.json的customizations.vscode.extensions是**项目级**——换个
+#   仓库就没了。这份清单由 ~/dotfiles/install.sh在**每个新环境**里装一遍，
+#   所以是层④「换项目、换容器都还在」。项目专属的扩展仍该写进该项目的
+#   devcontainer.json，别塞进这里。
+#
+# 实测坑：容器里有**两个互不相通的VS Code server**，各有各的扩展目录——
+#   ~/.vscode-server/          桌面VS Code走Remote连进来
+#   ~/.vscode-browser-server/  Ona网页版
+# 只装一侧，从另一侧连进来就什么都看不到。2026-08-07实测：github PR扩展只在
+# 网页版侧有、桌面Remote侧没有。install_extensions.sh会两侧都装。
+
+# GitHub PR / Issue面板：在编辑器里看PR、评论、checkout分支
+github.vscode-pull-request-github
+
+# YAML（automations.yaml / devcontainer / GitHub Actions的补全与校验）
+redhat.vscode-yaml
+
+# Python全家桶（多数项目的devcontainer feature也会带，这里保证没feature的项目也有）
+ms-python.python
+ms-python.vscode-pylance
+ms-python.debugpy
+ms-python.autopep8
+
+# ── 刻意不放这里的 ─────────────────────────────────────────────────────────
+# anthropic.claude-code —— 桌面Remote侧由你手动/Ona装好并接了内网代理；
+#   往Ona网页版侧再装一份会出现第二个未接代理的入口，容易混淆。要装请自己
+#   在对应窗口里装，别声明在这里。
+# silicon-hitchhiker.cutlet-bro —— 本地 .vsix、属WY-workspace-P项目自带，
+#   由该仓tools/install-vscode-extensions.sh负责，不是跨项目的东西。

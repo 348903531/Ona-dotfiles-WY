@@ -45,6 +45,31 @@
 **交付时必须说清作用域**:每次汇报改动，写明这条是「跨项目通用」还是「只对本项目」。
 用户看不到落点，只能靠你说。
 
+### 落进去了 ≠ 现在还活着——设置类改动必跑 `dotfiles-doctor`
+
+跨项目机制**会静默失效**,而且坏了不吭声：软链断了、hook指到已删的目录、dotfiles改了
+没push、**系统脚本把你的配置整文件覆盖了**。判据从「有没有落到层④」再进一层：
+**「现在这一刻它还在不在」**。做完任何设置类改动、或开局怀疑哪条规矩没生效时，跑一条：
+
+```bash
+dotfiles-doctor          # 全绿才算数;有 FAIL 会直接给出修复命令
+```
+
+它逐层查：dotfiles仓库(干净且已push)→ 全局CLAUDE.md软链 → 用户级
+`permissions.ask`/hook还在不在 → welcome-claude补丁 → 两侧VS Code扩展，并提示
+两项**只能你自己在本地VS Code确认**的(Bypass开关要勾在 **User** 而非Remote;
+Ona账户里要填dotfiles仓库地址)。
+
+**真实事故(2026-08-07,本条的由来)**:镜像自带 `/usr/local/bin/welcome-claude.sh`
+被 `~/.bashrc` 无条件source,它用 `jq ... > ~/.claude/settings.json` **整文件覆盖**
+写内网代理env——于是每开一个bash(包括Claude Code启动时做shell-snapshot那个),
+用户级20条 `permissions.ask` 与两个hook**全部蒸发**。装是装过了，当天被清空至少三次，
+**全程零报错**。这不是「闸门放行了错的」,是「闸门被别人删了、还不吭声」。
+修法两层：`claude/patch_welcome_claude.sh` 把覆盖改成合并(从源头止血),
+`shell/aliases.sh` 里的 `_ona_claude_settings_heal` 在每个新shell里补写(补丁失效时兜底)。
+**可迁移的通用形态：凡靠「环境里装了什么」生效的东西，都要配一道「它还在不在」的自查；
+且别只问「谁把它装上」,要问「谁可能把它盖掉」。**
+
 ## 工作方式
 
 - **先澄清再执行**:当意图模糊且代价高(耗时长/不可逆/有数据风险)时，先在正文里用
