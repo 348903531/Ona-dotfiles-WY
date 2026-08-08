@@ -142,6 +142,15 @@ def _msg_text(entry):
     """从 transcript 一行里取出真实的用户文本；非用户消息返回 None。"""
     if entry.get("type") != "user":
         return None
+    # **不是用户真说的话，一律排除**。Skill / slash-command 的正文是以 role=user
+    # 注入 transcript 的，肉眼看不出区别，但会被当成「用户这条消息」抽问题——
+    # 2026-08-08 实测：调一次 lesson-capture，它 SKILL.md 里的散文（「场景 = 什么
+    # 时候会踩」之类）被抽成 **19 个问题** 报给我。后果不是多几行噪音，而是把真正
+    # 漏答的问题淹掉，几次之后这个提醒就彻底失信——本 hook 存在的意义正是「别漏答」。
+    # 判据取自实物：拿本会话 transcript 逐行核过，注入行带 isMeta=True + sourceToolUseID，
+    # 5 条真实用户消息两者皆无，零重叠。两个都查是双保险（不同注入源可能只带其一）。
+    if entry.get("isMeta") or entry.get("sourceToolUseID"):
+        return None
     msg = entry.get("message") or {}
     if msg.get("role") != "user":
         return None
@@ -332,6 +341,36 @@ def _selftest():
     want(all("重试" not in q for q, _ in qs2), "tool_result 里的问句没被误抽")
     want(all("闸门" not in q for q, _ in qs2), "system-reminder 里的问句没被误抽")
     os.unlink(path)
+
+    # 5b) Skill / slash-command 注入的正文**不得**被当成用户提问。
+    #     2026-08-08 实测：调一次 lesson-capture，其 SKILL.md 的散文被抽成 19 个
+    #     「问题」报出来，把真正漏答的淹掉。注入行以 role=user 落进 transcript，
+    #     肉眼与真实提问无异，只有 isMeta / sourceToolUseID 能区分（判据取自实物：
+    #     本会话 transcript 里注入行两者皆有、5 条真实用户消息两者皆无，零重叠）。
+    #     **注入行必须排在最后**——collect() 只对 users[-1] 抽问题，注入行放在
+    #     真实消息之前的话，排除逻辑失效也测不出来。初版就是这么写的：把判据改成
+    #     `if False:` 仍 20/20 全绿，纯假绿。这是「变异测试要验测试本身跑没跑到
+    #     被测代码」在同一天内的第二次实例（第一次见 session-change-digest 的 ④c），
+    #     也正是这条教训刚被沉淀进 lessons-index 的原因。
+    fd3, path3 = tempfile.mkstemp(suffix=".jsonl")
+    with os.fdopen(fd3, "w", encoding="utf-8") as fh:
+        for rec in [
+            {"type": "user", "message": {"role": "user",
+                "content": "这个能默认打开吗？另外帮我查一下版本号。"}},
+            {"type": "user", "sourceToolUseID": "toolu_y",
+             "message": {"role": "user", "content": "要不要开闸门？要不要建 skill？"}},
+            {"type": "user", "isMeta": True, "sourceToolUseID": "toolu_x",
+             "message": {"role": "user", "content": [{"type": "text", "text":
+                 "场景 = 什么时候会踩？教训 = 该怎么做？这样落可以吗？"}]}},
+        ]:
+            fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
+    qs3, _e3 = collect(path3)
+    want(len(qs3) == 2, "skill 注入被排除后，只抽真实用户消息的 2 个问题（实抽 %d）" % len(qs3))
+    want(all("场景" not in q and "教训" not in q for q, _ in qs3),
+         "isMeta 注入（skill 正文）里的问句没被误抽")
+    want(all("闸门" not in q and "skill" not in q for q, _ in qs3),
+         "带 sourceToolUseID 的注入里的问句没被误抽")
+    os.unlink(path3)
 
     # 6) 坏输入：文件不存在 / 空文件 → 静默且不抛异常
     want(collect("/nonexistent/xx.jsonl") == ([], set()), "坏输入：文件不存在 → 静默")

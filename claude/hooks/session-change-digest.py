@@ -225,6 +225,73 @@ def _extract_script_source(cmd):
     return None
 
 
+def _python_write_targets(src):
+    """AST 取出这段 python 里**静态可知**的写盘目标路径（字符串字面量）。
+
+    与 `_python_writes_file` 分开写：那个只回答「写没写」（宁可多记不漏记），
+    这个回答「写到哪」（用于判断是不是过程性噪音）。路径藏在变量里时取不到 ——
+    返回空列表，由调用方决定怎么处理（见 `_is_process_noise` 的取舍说明）。
+    """
+    out = []
+    try:
+        tree = ast.parse(src)
+    except (SyntaxError, ValueError):
+        return out
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call) or not node.args:
+            continue
+        f = node.func
+        # 取路径时**额外认 `open`**：`io.open(p, "w")` 的 attr 是 "open"，它不在
+        # _WRITE_ATTRS 里（那个集合是给「写没写」用的，那条链靠后面的 `.write(` 命中）。
+        # 不加这一条，最常见的 io.open(字面量路径,"w") 反而取不到路径。
+        named = (isinstance(f, ast.Name) and f.id in (_WRITE_FUNCS | {"open"})) or \
+                (isinstance(f, ast.Attribute) and (f.attr in _WRITE_ATTRS or f.attr == "open"))
+        if not named:
+            continue
+        for a in node.args:
+            if isinstance(a, ast.Constant) and isinstance(a.value, str) \
+                    and ("/" in a.value or a.value.endswith((".py", ".json", ".md"))):
+                out.append(a.value)
+    return out
+
+
+def _is_process_noise(key, cmd):
+    """这条 move / script_write 是不是**过程性噪音**（用户 2026-08-08 点名要静音）。
+
+    用户原话：「移动/复制文件 ×3、脚本内写了文件 ×5 —— 这俩本身没什么风险，
+    提醒了也没意义。」确实：那 8 条全是做测试时的 cp 备份和临时 jsonl 夹具。
+
+    **刻意不整类删掉**，而是按路径判——整类删会丢掉 PR #391 补的账本盲区
+    （「脚本内写的文件此前完全看不见」），那是真实事故换来的。判据：
+
+    · move（mv/cp）：**任一端**落在临时目录 → 过程性。覆盖备份（真实→/tmp）和
+      恢复（/tmp→真实）两个方向；真实→真实的移动仍照记（那可能是在挪交付物）。
+    · script_write：静态解析得到的写目标**全部**是临时路径 → 过程性。
+      **解析不出路径时照记**（不静音）。初版这里写的是「解析不出就静音」，一跑自测
+      就打破了 bug1c 回归——而那条用例正是 PR #391 那次真实事故的重现（heredoc 里
+      `io.open(sys.argv[1], "w")` 改 VS Code settings.json，路径在变量里、静态解析
+      不出）。也就是说那个取舍会**精准地**把真实事故场景重新变成盲区。宁可多记一条，
+      不漏记——这是本模块一以贯之的纪律，不为降噪破例。
+
+    两次同型教训（都记在这里，别再犯第三次）：降噪规则的粒度一宽就会吃掉承重信息。
+    上一轮是「无文件改动就整份静默」打破 6 条回归；这一轮是「解析不出就静音」打破
+    bug1c。判据：**降噪只能作用于「已确证无关」的东西，不能作用于「判不出」的东西。**
+    """
+    if key == "move":
+        units = _command_units(_strip_heredocs(cmd))
+        if not units:
+            return False
+        paths = [a for head, args in units if head in ("mv", "cp")
+                 for a in args if not a.startswith("-")]
+        return bool(paths) and any(_is_temp_path(p) for p in paths)
+    if key == "script_write":
+        targets = _python_write_targets(_extract_script_source(cmd) or "")
+        if not targets:
+            return False         # 解析不出目标 → 照记，绝不静音（理由见上）
+        return all(_is_temp_path(p) for p in targets)
+    return False
+
+
 def _python_writes_file(src):
     """AST 判定：这段 python 代码里有没有**真的调用**写文件。解析失败返回 None。"""
     try:
@@ -388,6 +455,32 @@ def _first_meaningful_line(cmd):
     return cmd.strip().splitlines()[0][:80] if cmd.strip() else ""
 
 
+def _destructive_detail(cmd):
+    """找出命令里**真正触发**破坏性判定的那一段，而不是命令首行。
+
+    为什么不能用 `_first_meaningful_line`：一条命令常常前半截无害、后半截才危险，
+    例如 `git --no-pager diff -- x > /tmp/p; git checkout -- x` —— 命中的是
+    `git checkout --`，首行却是只读的 `git diff`。清单于是在 ⚠️ 后面摆了一句无辜的
+    命令，看上去像闸门误报。**实测代价**：我自己第一眼也判成了误报，去翻闸门源码才
+    确认它判得没错、错的是显示。用户看几次「只读命令被标破坏性」就不会再信这个标记，
+    而这个标记恰恰是清单里最不能被忽略的一行。
+
+    做法：逐个命令单元单独送回同一个判据（destructive-command-guard 的 `_scan`），
+    第一个命中的就是真凶。刻意复用同一判据、不另写一套 —— 归因与判定必须永远同一
+    结论，否则会出现「标了 ⚠️ 却指向一段其实不危险的文本」的第二种错位。
+    重组片段丢引号只影响显示；万一逐段都不命中（重组丢了上下文），退回原行为。
+    """
+    if _DESTRUCTIVE_SCAN:
+        try:
+            for head, args in (_command_units(_strip_heredocs(cmd)) or []):
+                seg = " ".join([head] + list(args))
+                if _DESTRUCTIVE_SCAN(seg):
+                    return seg[:80]
+        except Exception:
+            pass
+    return _first_meaningful_line(cmd)
+
+
 FAILED_RESULT_RE = re.compile(
     r"denied by|permission for this action was denied|user doesn't want to|"
     r"operation (?:was )?(?:cancelled|aborted)|tool use was rejected",
@@ -483,7 +576,7 @@ def collect(transcript_path, start_line):
                     if m:
                         detail = m.group("b")
                 elif key == "destructive":
-                    detail = _first_meaningful_line(raw)
+                    detail = _destructive_detail(raw)
                 # ③ 可逆动作 + 细节已在回复正文里原样点名 → 用户已经知道，不重复记账。
                 #    刻意要求 detail 非空且**逐字命中**：拿不准就照记，宁可多列一行，
                 #    也不能让降噪把该报的吃掉。不可逆的（NEVER_FILTER）永不走这条。
@@ -491,6 +584,10 @@ def collect(transcript_path, start_line):
                 #    6 条既有回归测试（那些正是在验 commit/push 有没有被记上账），
                 #    说明规则粒度错了：该过滤的是「单条已知信息」，不是「整份清单」。
                 if key not in NEVER_FILTER and detail and detail in said_text:
+                    continue
+                # ④ 过程性噪音（测试用的 cp 备份、临时 jsonl 夹具）不记账。
+                #    同样只作用于可逆项：move / script_write 都不在 NEVER_FILTER 里。
+                if key not in NEVER_FILTER and _is_process_noise(key, raw):
                     continue
                 bucket = actions.setdefault(key, {"label": label, "n": 0, "detail": []})
                 bucket["n"] += 1
@@ -710,7 +807,59 @@ def _selftest():
                      "③c 不可逆操作（删除）即使回复里原样说过也照常记账")
     want("上传到 Drive" in render(d_loud), "③c 外发上传照常列")
 
-    for _p in (p_tmp, p_said, p_think, p_quiet, p_untold, p_loud):
+    # ⑤ 破坏性操作的 detail 要指向**真正触发判定的那一段**，不是命令首行。
+    #    真实误导（本轮亲历）：`git diff ... > /tmp/p; git checkout -- x` 命中的是
+    #    checkout，清单却在 ⚠️ 后面摆了只读的 git diff，看上去像闸门误报——我自己
+    #    第一眼也这么判，翻了闸门源码才知道判定没错、错的是归因显示。
+    p_attr = build([
+        rec("Bash", {"command":
+                     "git --no-pager diff -- a.md > /tmp/p.patch; git checkout -- a.md"}),
+    ])
+    d_attr, _ = collect(p_attr, 0)
+    _det = (d_attr["actions"].get("destructive") or {}).get("detail") or [""]
+    want_destructive("checkout" in _det[0],
+                     "⑤ 破坏性 detail 指向真正触发的那段（checkout），不是首行")
+    want_destructive("--no-pager diff" not in _det[0],
+                     "⑤ 破坏性 detail 不再摆出无辜的只读首行（避免看着像误报）")
+    os.unlink(p_attr)
+
+    # ④ 过程性噪音静音（用户 2026-08-08 点名：cp 备份、临时 jsonl 夹具别列）
+    p_noise = build([
+        rec("Bash", {"command": "cp hooks/x.py /tmp/x.bak"}),          # 备份 → 静音
+        rec("Bash", {"command": "cp /tmp/x.bak hooks/x.py"}),          # 恢复 → 静音
+        rec("Bash", {"command":
+                     "python3 -c \"io.open('/tmp/t.jsonl','w').write('x')\""}),
+    ])
+    d_noise, _ = collect(p_noise, 0)
+    want("move" not in d_noise["actions"],
+         "④ cp 备份/恢复（任一端在临时目录）不记账")
+    want("script_write" not in d_noise["actions"],
+         "④ 脚本写临时夹具不记账")
+
+    # ④b 但**真实路径**的移动与脚本写盘必须照记——整类静音会丢掉 PR #391 补的
+    #     账本盲区（脚本内写的文件此前完全看不见），那是真实事故换来的。
+    p_real = build([
+        rec("Bash", {"command": "mv docs/old.md docs/new.md"}),
+        rec("Bash", {"command":
+                     "python3 -c \"io.open('/repo/deliverable.md','w').write('x')\""}),
+    ])
+    d_real, _ = collect(p_real, 0)
+    want("move" in d_real["actions"], "④b 真实路径之间的移动照常记账")
+    want("script_write" in d_real["actions"], "④b 脚本写真实路径照常记账")
+
+    # ④c 写目标**解析不出**（藏在变量/argv 里）时必须照记，绝不静音——
+    #     这正是 PR #391 那次真实事故的形态。初版「解析不出就静音」会精准地
+    #     把它重新变成盲区，被 bug1c 回归当场抓住。这条把判据钉死在这里。
+    p_unknown = build([
+        rec("Bash", {"command":
+                     "python3 - \"$P\" <<'PY'\nio.open(sys.argv[1],'w').write(x)\nPY"}),
+    ])
+    d_unknown, _ = collect(p_unknown, 0)
+    want("script_write" in d_unknown["actions"],
+         "④c 写目标解析不出时照常记账（不拿「判不出」当「无关」）")
+    os.unlink(p_unknown)
+
+    for _p in (p_tmp, p_said, p_think, p_quiet, p_untold, p_loud, p_noise, p_real):
         os.unlink(_p)
 
     # 空 transcript → 静默
@@ -808,7 +957,23 @@ def _selftest():
     out7 = render(data7)
     want("脚本内写了文件" in out7,
          "bug1c 回归：heredoc 里的 io.open(...,'w') 被记账（此前完全看不见）")
-    want("移动/复制文件" in out7, "同条命令里的 cp 仍然记得到（没被顶掉）")
+    # 这条断言原文是「同条命令里的 cp 仍然记得到（没被顶掉）」，意图是防**两类动作
+    # 互相顶掉**（script_write 记了就把 move 吞掉）。2026-08-08 加入 ④ 过程性静音后，
+    # 本用例里的 `cp "$P" /tmp/x.bak.json` 有一端落在 /tmp，是按新规则**故意**不记的
+    # ——不是被顶掉。用例不再适合验原意图，故：① 这里改为钉住「静音的原因是 ④ 而非
+    # 被顶掉」；② 原意图另用不含临时路径的命令验（见下）。**没有删掉这个意图**，
+    # 只是换了承载它的用例——直接删断言就会让「互相顶掉」这个真 bug 重新无人看守。
+    want("移动/复制文件" not in out7,
+         "同条命令里的 cp 落在 /tmp → 按 ④ 静音（区别于「被顶掉」，见下一条）")
+    fd7b, path7b = tempfile.mkstemp(suffix=".jsonl")
+    real_cmd_b = real_cmd.replace("/tmp/x.bak.json", "/repo/backups/x.bak.json")
+    with os.fdopen(fd7b, "w", encoding="utf-8") as fh:
+        fh.write(rec("Bash", {"command": real_cmd_b}) + "\n")
+    data7b, _ = collect(path7b, 0)
+    out7b = render(data7b)
+    want("脚本内写了文件" in out7b and "移动/复制文件" in out7b,
+         "同条命令里 script_write 与 cp 都记得到（两类不互相顶掉）")
+    os.unlink(path7b)
 
     # 别修过头：只读脚本不该被记成写文件
     fd8, path8 = tempfile.mkstemp(suffix=".jsonl")
