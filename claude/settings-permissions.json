@@ -4,6 +4,8 @@
   "outputStyle": "说人话",
   "_ask_note": "少数「做完回不去」的操作，无论切到哪种权限模式都必须停下来问一次。为什么放 permissions.ask 而不是只靠 hook：官方文档明文保证 explicit ask rules 在 bypassPermissions 模式下**仍然强制弹窗**（hook 在该模式下的行为文档没写死）——这是唯一有明文保证的确定层。局限（诚实）：ask 是前缀匹配，`cd /x && git reset --hard` 这种藏在 && 后半截的匹配不到，那由 destructive-command-guard hook 用命令位置解析补上。刻意只放这些：放多了就又回到「看不懂、全点 yes」，安全网退化成噪音。",
   "permissions": {
+    "_defaultMode_note": "新会话起步用哪种权限模式。设 bypassPermissions 的原因（用户 2026-08-08 明确要求）：技术执行类弹窗（原始 shell 命令 / diff）用户看不懂、每次只能点 yes，等于净打断——改成「不逐次事前确认，换一次性事后对账」（收尾由 session-change-digest hook 自动打印本轮全部改动，用户按清单复核，不对再回溯）。**为什么这个键能做到「跨项目、跨容器永久生效」**：官方文档 permission-modes 明文 “Enable it at launch with permissions.defaultMode: \"bypassPermissions\" in settings”，即写进用户级 settings 就是持久默认，**不需要每次开会话手动切**（早先仓库里记的「必须每次启动时启用」是读错了——原文只是说不能在会话**中途**切进去）。**代价，用户已知情**：该模式对提示词注入零防护，官方要求只在隔离容器/VM/devcontainer 里用——本工作台正是 devcontainer，符合推荐条件。**仍会弹的三类，刻意保留**：① 下面 ask 数组那些做完回不去的操作（官方保证 explicit ask rules 在本模式下仍强制弹窗）；② rm -rf / 与 rm -rf ~ 的内置熔断；③ 组织策略把本模式禁掉时自动退回。**VS Code 扩展侧还要用户自己勾一次** Allow dangerously skip permissions（extension setting claudeCode.allowDangerouslySkipPermissions），agent 无权代劳——那属自我授权，安全分类器硬拒。**想收紧回去**：把本键改成 default / plan / auto 即可，install.sh 是「缺失才写」，不会把你改回来。",
+    "defaultMode": "bypassPermissions",
     "ask": [
       "Bash(git push --force:*)",
       "Bash(git push -f:*)",

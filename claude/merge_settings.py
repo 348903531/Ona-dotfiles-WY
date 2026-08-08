@@ -39,6 +39,16 @@ DEFAULT_TARGET = os.path.expanduser("~/.claude/settings.json")
 # 想恢复我们的默认：把该键从 ~/.claude/settings.json 删掉，下次 install 会补回。
 TOP_LEVEL_SCALARS = ("outputStyle",)
 
+# `permissions` 下的标量键：同样**只在缺失时写入，绝不覆盖**。
+# 目前只有 `defaultMode`（会话起步用哪种权限模式）。它是官方支持写进 settings 的
+# 持久默认（文档 permission-modes：「Enable it at launch with
+# permissions.defaultMode: "bypassPermissions" in settings」），所以「一次配置、
+# 换项目换容器都还在」这件事**不需要**每次开会话手动切模式——早先仓库里记的
+# 「必须每次启动时启用」是读错了，实际那句只是说不能在会话中途切进去。
+# 缺失才写的理由同 outputStyle：用户自己在 /config 或设置里改过就该尊重；
+# 想恢复默认，把这个键从 ~/.claude/settings.json 删掉，下次 install 会补回。
+PERMISSION_SCALARS = ("defaultMode",)
+
 
 def _load(path, default):
     if not os.path.isfile(path):
@@ -65,6 +75,20 @@ def merge(target, frag):
         # 说明性注释键：只在缺失时补，不覆盖用户改过的措辞
         if "_ask_note" in frag and "_ask_note" not in perms:
             perms["_ask_note"] = frag["_ask_note"]
+            changed = True
+
+    # ── permissions 下的标量键（defaultMode）：缺失才写，已有则尊重 ──────
+    frag_perms = frag.get("permissions") or {}
+    for key in PERMISSION_SCALARS:
+        if key in frag_perms:
+            perms = target.setdefault("permissions", {})
+            if key not in perms:
+                perms[key] = frag_perms[key]
+                changed = True
+    if "_defaultMode_note" in frag_perms:
+        perms = target.setdefault("permissions", {})
+        if "_defaultMode_note" not in perms:
+            perms["_defaultMode_note"] = frag_perms["_defaultMode_note"]
             changed = True
 
     # ── 顶层标量键（outputStyle）：缺失才写，已有则尊重用户的选择 ────────
@@ -166,6 +190,8 @@ def _selftest():
     want("PreToolUse" in t["hooks"] and "Stop" in t["hooks"], "两个 hook 事件都写入")
 
     want(t.get("outputStyle") == "说人话", "空目标：outputStyle 写入")
+    want(t["permissions"].get("defaultMode") == "bypassPermissions",
+         "空目标：permissions.defaultMode 写入")
 
     # 2) 幂等：再合一次不应有变化
     want(merge(t, frag) is False, "幂等：重复合并无变化")
@@ -177,6 +203,15 @@ def _selftest():
     want(t_style["outputStyle"] == "Explanatory",
          "用户已选的 outputStyle 不被覆盖")
     want(changed_style is True, "同一次合并里其它键仍照常写入（不因跳过标量而整体短路）")
+
+    # 2c) permissions.defaultMode **已存在**时同样绝不覆盖。与 ask 的「并集」语义相反，
+    #     必须单独验：这是权限总开关，写成覆盖 = install.sh 每次开环境都替用户重设权限，
+    #     用户主动收紧回 default/plan 会被静默改回去，属最不可接受的一类退化。
+    t_mode = {"permissions": {"defaultMode": "plan"}}
+    changed_mode = merge(t_mode, frag)
+    want(t_mode["permissions"]["defaultMode"] == "plan",
+         "用户已设的 permissions.defaultMode 不被覆盖")
+    want(changed_mode is True, "跳过 defaultMode 后其它键仍照常写入")
 
     # 3) 不碰已有的 env（最关键——那里有不能丢的内网代理与 PII）
     t2 = {"env": {"ANTHROPIC_BASE_URL": "http://proxy", "X": "keep me"}}

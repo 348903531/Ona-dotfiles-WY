@@ -103,6 +103,31 @@
 - **`claudeCode.allowDangerouslySkipPermissions` 这类权限总开关只能用户自己在User层开**:
   agent写它 = 自我授权，Claude Code安全分类器硬拒，别去碰。
 
+### 不弹窗这件事：两个开关是一对，别只记住用户那一半(2026-08-08改正)
+
+用户诉求(原话)「BASH确认弹窗我看不懂、都会点yes，莫不如完全不要问我，你执行到结束
+再告诉我做了什么，有问题我让你回溯」。落地是**两个开关，缺一不可**,分属两层：
+
+| 开关 | 落点 | 决定什么 | 谁来设 |
+|---|---|---|---|
+| `permissions.defaultMode: "bypassPermissions"` | `~/.claude/settings.json`(dotfiles的`settings-permissions.json`+`merge_settings.py`注入) | **新会话起步在哪个模式** | agent可准备，**用户执行落地** |
+| `claudeCode.allowDangerouslySkipPermissions` | VS Code **User** 标签页(本地电脑) | 这台电脑**允不允许出现**该模式 | **只能用户自己勾** |
+
+**改正一条曾经记错的结论**:此前本文件与WY仓AGENTS.md卡#27写着「Bypass须**每次启动时**
+启用」,据此认为做不成持久默认、只能每次手点。**错了**——官方`permission-modes`文档明文
+「Enable it at launch with `permissions.defaultMode: "bypassPermissions"` in settings」,
+即**写进用户级settings就是持久默认**;原文那句"can't enter from a session that was started
+without it"说的只是不能在会话**中途**切进去，不是"每次都要手动"。这条错误让"跨项目免弹窗"
+被误判为不可能、白绕了两轮。**教训可迁移：把文档里的『不能中途改』读成『每次都要手动设』,
+是把runtime限制误当成config限制——遇到"只能启动时生效"的说法，先去查有没有对应的
+持久化配置键。**
+
+**仍会弹的三类，刻意保留**:① `permissions.ask` 那20条不可逆操作(官方保证explicit ask
+rules在bypass模式下仍强制弹窗);② `rm -rf /` 与 `rm -rf ~` 内置熔断；③ 组织策略禁用该
+模式时自动退回。**代价要让用户知情**:bypass对提示词注入零防护，官方要求只在隔离容器/VM/
+devcontainer里用。**配套义务**:放弃逐次事前确认，就**必须**有一次性事后对账——由
+`session-change-digest` Stop hook自动打印本轮全部改动(agent忘了写也照样出现)。
+
 **交付时必须说清作用域**:每次汇报改动，写明这条是「跨项目通用」还是「只对本项目」。
 用户看不到落点，只能靠你说。
 

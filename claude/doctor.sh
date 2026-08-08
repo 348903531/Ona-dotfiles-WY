@@ -106,12 +106,13 @@ fi
 head_ "3) 用户级权限安全网 ~/.claude/settings.json"
 SET="$HOME/.claude/settings.json"
 if [ -f "$SET" ]; then
-  read -r n_ask n_hook has_env <<<"$(python3 - "$SET" <<'PY' 2>/dev/null || echo "err err err"
+  read -r n_ask n_hook has_env dmode <<<"$(python3 - "$SET" <<'PY' 2>/dev/null || echo "err err err err"
 import json,sys
 d=json.load(open(sys.argv[1]))
 print(len((d.get("permissions") or {}).get("ask") or []),
       sum(len(v) for v in (d.get("hooks") or {}).values()),
-      int("ANTHROPIC_BASE_URL" in (d.get("env") or {})))
+      int("ANTHROPIC_BASE_URL" in (d.get("env") or {})),
+      (d.get("permissions") or {}).get("defaultMode") or "-")
 PY
 )"
   if [ "$n_ask" = "err" ]; then
@@ -124,6 +125,17 @@ PY
       || bad "用户级 hook 只有 $n_hook 个（应 ≥2）" "python3 ~/dotfiles/claude/merge_settings.py"
     [ "${has_env:-0}" = "1" ] && ok "内网代理 env 完好（合并没伤到它）" \
       || warn "env.ANTHROPIC_BASE_URL 不在——新开一个终端会自动补回"
+    # defaultMode：会话起步用哪种权限模式。没有这个键 = 每个新会话都从 Manual 起步、
+    # 每条命令都弹窗——这正是「装过 ≠ 现在还活着」在权限层的形态，而且它坏了完全不吭声
+    # （不会报错，只是又开始一直问你）。刻意不把「值不是 bypassPermissions」判成 bad：
+    # 用户主动收紧回 default/plan/auto 是合法选择，体检不该逼他改回来。
+    case "${dmode:--}" in
+      -)  warn "permissions.defaultMode 没设——新会话会从 Manual 起步、每条命令都弹窗" \
+               "python3 ~/dotfiles/claude/merge_settings.py" ;;
+      bypassPermissions)
+          ok "defaultMode=bypassPermissions（技术执行类不再弹窗；ask 那 ${n_ask} 条仍会问）" ;;
+      *)  ok "defaultMode=$dmode（你自己设的，体检不改它）" ;;
+    esac
   fi
 else
   bad "settings.json 不存在" "python3 ~/dotfiles/claude/merge_settings.py"
@@ -206,6 +218,9 @@ head_ "6) 容器内查不到的两项（存在你本地电脑上）"
 printf '  %s· Bypass permissions 总开关：VS Code 设置搜 "dangerously skip"，\n' "$D"
 printf '    必须勾在 %sUser%s 标签页（跟你这台电脑走、对所有项目生效），\n' "$N$D" "$D"
 printf '    勾在 Remote/Workspace 就只对当前容器/当前项目成立。\n'
+printf '    与上面第 3 节的 defaultMode 是%s一对%s、缺一不可：defaultMode 决定\n' "$N$D" "$D"
+printf '    「新会话起步在哪个模式」（跟 dotfiles 走、换容器还在），这个 toggle\n'
+printf '    决定「这台电脑上允不允许出现该模式」。agent 无权代勾——那属自我授权。\n'
 printf '  · dotfiles 仓库地址：Ona 账户设置 → Dotfiles，填 Ona-dotfiles 仓库。\n'
 printf '    没填的话新环境不会自动 clone，本文件所有检查都无从谈起。%s\n' "$N"
 
