@@ -1,6 +1,9 @@
 {
   "_readme": "要合并进 ~/.claude/settings.json 的**用户级**片段——对你打开的每一个项目生效（不是只对某个仓库）。由 install.sh 调 merge_settings.py 幂等注入，只加这里声明的键，绝不覆盖你已有的 env / 其它设置。来源与全文见 WY-workspace-P 仓库 AGENTS.md 卡#27/#28。",
 
+  "_outputStyle_note": "默认输出风格。对应 claude/output-styles/plain-chinese.md（由 install.sh 软链进 ~/.claude/output-styles/）。为什么用 output style 而不是往 CLAUDE.md 里写语气要求：output style 进的是**系统提示词**且全程有 reminder 复述，CLAUDE.md 只是系统提示词之后的一条普通 user message——长会话 auto-compaction 摘要时，「开头交代的语气要求」正是最先被丢的一类（既不最近、又不属于某个具体步骤），于是越聊越漂移回机器腔。该风格设了 keep-coding-instructions: true，只改说话方式、不动写代码能力。合并语义是**缺失才写**：用户在 /config 里换了别的风格，install.sh 重跑不会把他换回来（想恢复默认就把这个键从 ~/.claude/settings.json 删掉）。",
+  "outputStyle": "说人话",
+
   "_ask_note": "少数「做完回不去」的操作，无论切到哪种权限模式都必须停下来问一次。为什么放 permissions.ask 而不是只靠 hook：官方文档明文保证 explicit ask rules 在 bypassPermissions 模式下**仍然强制弹窗**（hook 在该模式下的行为文档没写死）——这是唯一有明文保证的确定层。局限（诚实）：ask 是前缀匹配，`cd /x && git reset --hard` 这种藏在 && 后半截的匹配不到，那由 destructive-command-guard hook 用命令位置解析补上。刻意只放这些：放多了就又回到「看不懂、全点 yes」，安全网退化成噪音。",
   "permissions": {
     "ask": [

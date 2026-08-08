@@ -33,6 +33,12 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 FRAGMENT = os.path.join(HERE, "settings-permissions.json")
 DEFAULT_TARGET = os.path.expanduser("~/.claude/settings.json")
 
+# 顶层标量键：**只在缺失时写入，绝不覆盖**。
+# 语义与 permissions.ask 的「并集」不同——这类键只有一个值，覆盖就等于替用户做主。
+# 用户在 /config 里换了别的 output style，install.sh 下次重跑不该把他换回来。
+# 想恢复我们的默认：把该键从 ~/.claude/settings.json 删掉，下次 install 会补回。
+TOP_LEVEL_SCALARS = ("outputStyle",)
+
 
 def _load(path, default):
     if not os.path.isfile(path):
@@ -59,6 +65,12 @@ def merge(target, frag):
         # 说明性注释键：只在缺失时补，不覆盖用户改过的措辞
         if "_ask_note" in frag and "_ask_note" not in perms:
             perms["_ask_note"] = frag["_ask_note"]
+            changed = True
+
+    # ── 顶层标量键（outputStyle）：缺失才写，已有则尊重用户的选择 ────────
+    for key in TOP_LEVEL_SCALARS:
+        if key in frag and key not in target:
+            target[key] = frag[key]
             changed = True
 
     # ── hooks：按 id 去重，同 id 覆盖（dotfiles 是这两个 hook 的事实源）──
@@ -153,8 +165,18 @@ def _selftest():
     want(len(t["permissions"]["ask"]) == 20, "空目标：20 条 ask 全部写入")
     want("PreToolUse" in t["hooks"] and "Stop" in t["hooks"], "两个 hook 事件都写入")
 
+    want(t.get("outputStyle") == "说人话", "空目标：outputStyle 写入")
+
     # 2) 幂等：再合一次不应有变化
     want(merge(t, frag) is False, "幂等：重复合并无变化")
+
+    # 2b) 顶层标量键**已存在**时绝不覆盖——用户在 /config 里换过风格就该尊重。
+    #     这是与 permissions.ask「并集」相反的语义，必须单独验，不然改一行就悄悄退化成覆盖。
+    t_style = {"outputStyle": "Explanatory"}
+    changed_style = merge(t_style, frag)
+    want(t_style["outputStyle"] == "Explanatory",
+         "用户已选的 outputStyle 不被覆盖")
+    want(changed_style is True, "同一次合并里其它键仍照常写入（不因跳过标量而整体短路）")
 
     # 3) 不碰已有的 env（最关键——那里有不能丢的内网代理与 PII）
     t2 = {"env": {"ANTHROPIC_BASE_URL": "http://proxy", "X": "keep me"}}

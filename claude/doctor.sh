@@ -52,6 +52,56 @@ else
   bad "缺失：所有项目都读不到你的全局偏好" "bash ~/dotfiles/install.sh"
 fi
 
+# ── 2b. 输出风格（agent 怎么说话）─────────────────────────────────────────
+#
+# 这一层有个**独有的静默失效形态**，别的层没有：settings.json 里的 outputStyle 写着
+# 一个名字，而对应的风格文件没装上 / 名字对不上 → Claude Code 静默回退到 Default，
+# **不报错、不提示**，你只会觉得「怎么最近它又说回机器话了」，永远想不到是配置断了。
+# 所以这里不只查软链在不在，还要真解析 frontmatter 的 name，跟 settings 里的值对账。
+head_ "2b) 输出风格 ~/.claude/output-styles"
+_style_want="$(python3 -c "
+import json,sys
+try: print((json.load(open('$HOME/.claude/settings.json')) or {}).get('outputStyle') or '')
+except Exception: print('')
+" 2>/dev/null)"
+_style_dir="$HOME/.claude/output-styles"
+if [ -z "$_style_want" ]; then
+  warn "settings.json 没设 outputStyle——回复风格用内置 Default（机器腔）" \
+       "bash ~/dotfiles/install.sh"
+elif printf '%s' "$_style_want" | grep -qxE 'Default|Explanatory|Learning|Proactive'; then
+  ok "用的是内置风格「$_style_want」（不需要文件，正常）"
+else
+  # 自定义风格：必须能在已装的 .md 里找到同名 name（或同名文件）
+  _style_hit="$(python3 - "$_style_dir" "$_style_want" <<'PY' 2>/dev/null
+import os, re, sys
+d, want = sys.argv[1], sys.argv[2]
+for fn in sorted(os.listdir(d)) if os.path.isdir(d) else []:
+    if not fn.endswith(".md"):
+        continue
+    p = os.path.join(d, fn)
+    try:
+        head = open(p, encoding="utf-8").read(2000)
+    except Exception:
+        continue
+    m = re.search(r"^name:\s*(.+?)\s*$", head, re.M)
+    name = m.group(1).strip() if m else fn[:-3]
+    if name == want:
+        print(os.path.realpath(p))
+        break
+PY
+)"
+  if [ -n "$_style_hit" ]; then
+    case "$_style_hit" in
+      "$DOT"/*) ok "风格「$_style_want」已装且指向 dotfiles（换项目换容器都在）" ;;
+      *) warn "风格「$_style_want」装着，但不在 dotfiles 里——换台机器就没了" \
+              "bash ~/dotfiles/install.sh" ;;
+    esac
+  else
+    bad "settings 要用风格「$_style_want」，但 $_style_dir 里找不到它——Claude Code 会静默退回默认机器腔" \
+        "bash ~/dotfiles/install.sh"
+  fi
+fi
+
 # ── 3. 用户级权限安全网（最脆的一层）──────────────────────────────────────
 head_ "3) 用户级权限安全网 ~/.claude/settings.json"
 SET="$HOME/.claude/settings.json"

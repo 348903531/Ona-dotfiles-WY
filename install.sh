@@ -46,6 +46,27 @@ if [ -f "$DOTFILES_DIR/claude/CLAUDE.md" ]; then
 fi
 
 # ---------------------------------------------------------------------------
+# 1b. Output styles  (~/.claude/output-styles/)
+#
+# Output style 直接改 Claude Code 的**系统提示词**，且全程有 reminder 复述——
+# 这是它和 CLAUDE.md 的关键差别：CLAUDE.md 只是系统提示词之后的一条普通 user
+# message，长会话被 auto-compaction 摘要时，「开头交代的语气要求」正是最先被丢的
+# 一类（既不最近、又不属于某个具体步骤）。风格规则放 CLAUDE.md 里必然越聊越漂移，
+# 放这里不会。
+#
+# 用户级（~/.claude/output-styles/）→ 对每一个项目生效，符合「改动默认跨项目」。
+# 软链而非拷贝：改 dotfiles 里的文件即时生效，push 后新环境自动带上。
+# ---------------------------------------------------------------------------
+if [ -d "$DOTFILES_DIR/claude/output-styles" ]; then
+  mkdir -p "$HOME/.claude/output-styles"
+  for style in "$DOTFILES_DIR"/claude/output-styles/*.md; do
+    [ -e "$style" ] || continue
+    ln -sfn "$style" "$HOME/.claude/output-styles/$(basename "$style")"
+  done
+  log "linked ~/.claude/output-styles -> dotfiles"
+fi
+
+# ---------------------------------------------------------------------------
 # 2. Shell aliases / functions  (sourced from ~/.bashrc)
 #
 # Idempotent: we add a single guarded `source` line, not duplicate blocks.
