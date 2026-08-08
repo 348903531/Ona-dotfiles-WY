@@ -80,6 +80,29 @@ CACHE_DIR = os.path.expanduser("~/.cache/claude-change-digest")
 FILE_TOOLS = {"Write", "Edit", "MultiEdit", "NotebookEdit"}
 MAX_LIST = 12          # 单类最多列几条，超出折叠成「…等 N 项」
 
+# ── 降噪（用户 2026-08-08 要求）──────────────────────────────────────────────
+# 原话：「只有涉及到我没有做判断、你自动允许的这种 bash 操作，再换来这种对账清单。
+# 如果本身你就要告诉我，或者本身没什么风险，你反复提醒我这些清单就没有意义，而且
+# 增加我的工作量。」清单的价值在于**替代**被放弃的事前确认；重复列出用户已经知道的
+# 东西，是把省下的打断成本又以另一种形式加回去。两条过滤，都刻意只作用于**可逆**项：
+#
+# ① 临时目录：/tmp、/var/tmp、~/.cache 下的文件是过程产物（PR body 草稿、中间 JSON），
+#    环境一停就没，列出来纯噪音。
+# ② 回复已提及：文件名已经出现在本轮回复正文里 = 用户已经知道了，不必再列一遍。
+#
+# **不可逆项永不过滤**（destructive / rm / upload / send）：那些是承重信息，事后对账
+# 是用户唯一的发现途径，宁可重复也不能漏——与 output style「⚠️/🛑 警告、破坏性操作
+# 一律保留」同一条纪律。
+TEMP_PREFIXES = ("/tmp/", "/var/tmp/", "/dev/shm/")
+TEMP_SUFFIX_DIRS = ("/.cache/",)
+NEVER_FILTER = {"destructive", "rm", "upload", "send"}
+
+
+def _is_temp_path(p):
+    if p.startswith(TEMP_PREFIXES):
+        return True
+    return any(seg in p for seg in TEMP_SUFFIX_DIRS)
+
 # ── Bash 命令分类：(标识, 正则, 中文标签) ───────────────────────────────────
 ACTION_LABELS = [
     ("destructive", "⚠️ 破坏性操作"),
@@ -398,7 +421,11 @@ def _iter_tool_uses(transcript_path, start_line):
             for b in content:
                 if not isinstance(b, dict):
                     continue
-                if b.get("type") == "tool_use":
+                if b.get("type") == "text" and d.get("type") == "assistant":
+                    # 本轮回复正文——用来判断「这个改动我是不是已经在回复里告诉过用户了」。
+                    # 只取 assistant 的 text 块，不含思考块（用户看不到思考，那不算告知过）。
+                    yield "say", i, "", None, b.get("text") or ""
+                elif b.get("type") == "tool_use":
                     yield "use", i, b.get("id") or "", b.get("name") or "", b.get("input") or {}
                 elif b.get("type") == "tool_result":
                     body = b.get("content")
@@ -414,21 +441,29 @@ def _iter_tool_uses(transcript_path, start_line):
 def collect(transcript_path, start_line):
     """返回 (清单 dict, 读到的总行数)。"""
     files, actions, last = [], {}, start_line
-    pending, failed = [], set()
+    pending, failed, said = [], set(), []
     for kind, i, uid, name, inp in _iter_tool_uses(transcript_path, start_line):
         last = max(last, i + 1)
         if kind == "err":
             failed.add(uid)
+        elif kind == "say":
+            said.append(inp)
         else:
             pending.append((uid, name, inp))
+    said_text = "\n".join(said)
 
     for uid, name, inp in pending:
         if uid and uid in failed:
             continue                                   # 被拒/失败的调用不记账
         if name in FILE_TOOLS:
             p = inp.get("file_path") or inp.get("notebook_path")
-            if p and p not in files:
-                files.append(p)
+            if not p or p in files:
+                continue
+            if _is_temp_path(p):
+                continue                               # ① 临时目录：过程产物，不入账
+            if os.path.basename(p) and os.path.basename(p) in said_text:
+                continue                               # ② 回复里已点名，用户已知道
+            files.append(p)
         elif name == "Bash":
             raw = inp.get("command") or ""
             hit = _classify(raw)
@@ -449,6 +484,14 @@ def collect(transcript_path, start_line):
                         detail = m.group("b")
                 elif key == "destructive":
                     detail = _first_meaningful_line(raw)
+                # ③ 可逆动作 + 细节已在回复正文里原样点名 → 用户已经知道，不重复记账。
+                #    刻意要求 detail 非空且**逐字命中**：拿不准就照记，宁可多列一行，
+                #    也不能让降噪把该报的吃掉。不可逆的（NEVER_FILTER）永不走这条。
+                #    早先试过更狠的「无文件改动且无不可逆操作就整份静默」——它一次打破
+                #    6 条既有回归测试（那些正是在验 commit/push 有没有被记上账），
+                #    说明规则粒度错了：该过滤的是「单条已知信息」，不是「整份清单」。
+                if key not in NEVER_FILTER and detail and detail in said_text:
+                    continue
                 bucket = actions.setdefault(key, {"label": label, "n": 0, "detail": []})
                 bucket["n"] += 1
                 if detail and detail not in bucket["detail"]:
@@ -588,6 +631,87 @@ def _selftest():
     # 增量：从 last 再扫一次，应无新增 → 空清单（防重复报同一批改动）
     data2, _ = collect(path, last)
     want(render(data2) == "", "增量节流：同一批改动不会第二次上报")
+
+    # ── 降噪三条（用户 2026-08-08：清单别重复列我已经知道的事）─────────────
+    def say(text):
+        return json.dumps({"type": "assistant", "message": {"content": [
+            {"type": "text", "text": text}]}}, ensure_ascii=False)
+
+    def build(rows):
+        fd2, p2 = tempfile.mkstemp(suffix=".jsonl")
+        with os.fdopen(fd2, "w", encoding="utf-8") as fh2:
+            fh2.write("\n".join(rows) + "\n")
+        return p2
+
+    # ① 临时目录不入账（过程产物：PR body 草稿、中间 JSON）
+    p_tmp = build([
+        rec("Write", {"file_path": "/tmp/pr-body.md"}),
+        rec("Write", {"file_path": "/var/tmp/scratch.json"}),
+        rec("Write", {"file_path": "/home/u/.cache/x.txt"}),
+        rec("Write", {"file_path": "/repo/real.py"}),
+    ])
+    d_tmp, _ = collect(p_tmp, 0)
+    want(d_tmp["files"] == ["/repo/real.py"],
+         "① 临时目录（/tmp、/var/tmp、~/.cache）的文件不进清单，真实文件照收")
+
+    # ② 回复正文里已点名的文件不再重复列
+    p_said = build([
+        rec("Write", {"file_path": "/repo/mentioned.py"}),
+        rec("Write", {"file_path": "/repo/silent.py"}),
+        say("我改了 mentioned.py，加了一个参数。"),
+    ])
+    d_said, _ = collect(p_said, 0)
+    want(d_said["files"] == ["/repo/silent.py"],
+         "② 回复里已点名的文件不再重复列，没提的照列")
+
+    # ②b 只有 assistant 的 text 算「告知过」——思考块用户看不见，不能当已告知。
+    #     这条单独验，否则把 thinking 也当成 text 就会静默漏报，且极难发现。
+    p_think = build([
+        rec("Write", {"file_path": "/repo/hidden.py"}),
+        json.dumps({"type": "assistant", "message": {"content": [
+            {"type": "thinking", "thinking": "我要改 hidden.py"}]}}, ensure_ascii=False),
+    ])
+    d_think, _ = collect(p_think, 0)
+    want(d_think["files"] == ["/repo/hidden.py"],
+         "②b 思考块里提到不算告知过（用户看不见思考）")
+
+    # ③ 可逆动作，细节已在回复里原样点名 → 不重复记账
+    p_quiet = build([
+        rec("Bash", {"command": "git commit -m 'docs: 改个错字'"}),
+        rec("Bash", {"command": "git push -u origin feat/told-you"}),
+        say("我提交了『docs: 改个错字』，推到了 feat/told-you 分支。"),
+    ])
+    d_quiet, _ = collect(p_quiet, 0)
+    want("commit" not in d_quiet["actions"] and "push" not in d_quiet["actions"],
+         "③ 回复里已原样点名的 commit / push 不再重复记账")
+
+    # ③b 同样是 commit/push，但回复里**没**提 → 必须照常记账。
+    #     不验这条，③ 的实现哪怕退化成「一律不记 commit/push」也照样绿。
+    p_untold = build([
+        rec("Bash", {"command": "git commit -m 'docs: 改个错字'"}),
+        say("我看了一下代码结构。"),
+    ])
+    d_untold, _ = collect(p_untold, 0)
+    want("commit" in d_untold["actions"], "③b 回复里没提的 commit 照常记账")
+
+    # ③c 不可逆操作**永不**被这条过滤吃掉，哪怕回复里已经原样说过。
+    #     这是清单存在的理由：删除/外发是用户唯一的发现途径，宁可重复也不能漏。
+    #     **必须用「有 detail 的」不可逆动作来验**：初版这里用的是 upload，而 upload
+    #     根本不产生 detail，过滤条件 `detail and detail in said_text` 永远走不到——
+    #     于是把 NEVER_FILTER 整个清空，这条测试照样绿。变异测试当场抓出这个假绿。
+    #     destructive 会把命令首行存进 detail，是真正会撞上过滤分支的那一类。
+    p_loud = build([
+        rec("Bash", {"command": "rm -rf /workspaces/proj/out"}),
+        rec("Bash", {"command": "python3 up.py MediaFileUpload deck.pptx"}),
+        say("我执行了 rm -rf /workspaces/proj/out 删掉旧产物，并把 deck.pptx 传上了 Drive。"),
+    ])
+    d_loud, _ = collect(p_loud, 0)
+    want_destructive("destructive" in d_loud["actions"],
+                     "③c 不可逆操作（删除）即使回复里原样说过也照常记账")
+    want("上传到 Drive" in render(d_loud), "③c 外发上传照常列")
+
+    for _p in (p_tmp, p_said, p_think, p_quiet, p_untold, p_loud):
+        os.unlink(_p)
 
     # 空 transcript → 静默
     fd2, path2 = tempfile.mkstemp(suffix=".jsonl")

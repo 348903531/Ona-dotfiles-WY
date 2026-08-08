@@ -118,8 +118,13 @@ PY
   if [ "$n_ask" = "err" ]; then
     bad "settings.json 不是合法 JSON" "先人工修好它，再 python3 ~/dotfiles/claude/merge_settings.py"
   else
-    [ "${n_ask:-0}" -ge 20 ] && ok "permissions.ask $n_ask 条（不可逆操作仍会弹窗）" \
-      || bad "permissions.ask 只有 $n_ask 条（应 ≥20）——安全网被清空了" \
+    # 期望条数**从片段现读**，不写死——写死的话每次增删 ask 名单都要记得同步改这里，
+    # 漏改的那次正好是「名单被清空、体检却仍报绿」。同型教训见下方 hook 名那段。
+    _n_want="$(python3 -c "import json,io,sys;d=json.load(io.open(sys.argv[1],encoding='utf-8'));print(len((d.get('permissions') or {}).get('ask') or []))" \
+               "$DOT/claude/settings-permissions.json" 2>/dev/null)"
+    [ -n "$_n_want" ] && [ "$_n_want" -gt 0 ] 2>/dev/null || _n_want=11
+    [ "${n_ask:-0}" -ge "$_n_want" ] && ok "permissions.ask $n_ask 条（做完真回不去的操作仍会弹窗）" \
+      || bad "permissions.ask 只有 $n_ask 条（应 ≥$_n_want）——安全网被清空了" \
              "python3 ~/dotfiles/claude/merge_settings.py"
     [ "${n_hook:-0}" -ge 2 ] && ok "用户级 hook $n_hook 个（危险命令中文弹窗 + 收尾改动清单）" \
       || bad "用户级 hook 只有 $n_hook 个（应 ≥2）" "python3 ~/dotfiles/claude/merge_settings.py"

@@ -65,10 +65,17 @@ def merge(target, frag):
 
     # ── permissions.ask：并集去重，保留用户手工加的 ──────────────────────
     want_ask = (frag.get("permissions") or {}).get("ask") or []
-    if want_ask:
+    # 退役清单：**我们自己曾经发过、现在决定撤回**的条目，存在即移除。
+    # 为什么必须有它：ask 用并集语义（刻意的，保护用户手工加的条目），所以「从片段里
+    # 删掉一条」对已装过的环境毫无作用——那条会永远赖在 ~/.claude/settings.json 里继续
+    # 弹窗，只有全新环境才干净。同型教训本仓 2026-08-05 记过：同步机制只会叠加、不会
+    # 表达删除，用户删掉的东西会「又出来」。用户手工加的不在退役清单里，不受影响。
+    retired = frag.get("_ask_retired") or []
+    if want_ask or retired:
         perms = target.setdefault("permissions", {})
         have = perms.get("ask") or []
-        merged = list(have) + [a for a in want_ask if a not in have]
+        kept = [a for a in have if a not in retired]
+        merged = kept + [a for a in want_ask if a not in kept]
         if merged != have:
             perms["ask"] = merged
             changed = True
@@ -182,11 +189,16 @@ def _selftest():
             print("  FAIL: %s" % desc)
 
     frag = _load(FRAGMENT, {})
+    # 条数**从片段现读**，不写死。写死的话每次增删 ask 条目都要记得同步改这里，
+    # 而漏改的那次正好是「名单动了、测试却仍按老数字判绿」。同型教训 doctor.sh 已踩过一次
+    # （待查 hook 名曾写死，加了第三个 hook 后体检仍只查那两个老的、却报全绿）。
+    n_want = len((frag.get("permissions") or {}).get("ask") or [])
 
     # 1) 空目标 → 全量写入
     t = {}
     merge(t, frag)
-    want(len(t["permissions"]["ask"]) == 20, "空目标：20 条 ask 全部写入")
+    want(len(t["permissions"]["ask"]) == n_want,
+         "空目标：%d 条 ask 全部写入" % n_want)
     want("PreToolUse" in t["hooks"] and "Stop" in t["hooks"], "两个 hook 事件都写入")
 
     want(t.get("outputStyle") == "说人话", "空目标：outputStyle 写入")
@@ -223,7 +235,19 @@ def _selftest():
     t3 = {"permissions": {"ask": ["Bash(my-own-danger:*)"]}}
     merge(t3, frag)
     want("Bash(my-own-danger:*)" in t3["permissions"]["ask"], "用户手工加的 ask 保留")
-    want(len(t3["permissions"]["ask"]) == 21, "并集去重后 21 条")
+
+    # 4b) 退役条目：已装过的环境里必须**真的被删掉**，不能只对全新环境生效。
+    #     这是本次最容易假绿的一条——并集语义下「从片段删一条」看起来生效了（新环境干净），
+    #     实则老环境纹丝不动、继续弹窗。必须单独验。
+    retired = frag.get("_ask_retired") or []
+    want(len(retired) > 0, "片段声明了退役清单（否则下面两条测的是空集、恒真）")
+    t_ret = {"permissions": {"ask": list(retired) + ["Bash(my-own-danger:*)"]}}
+    merge(t_ret, frag)
+    left = t_ret["permissions"]["ask"]
+    want(not (set(retired) & set(left)), "退役条目在已装过的环境里被真的移除")
+    want("Bash(my-own-danger:*)" in left, "移除退役条目时不误伤用户手工加的")
+    want(len(t3["permissions"]["ask"]) == n_want + 1,
+         "并集去重后 %d 条（片段 %d + 用户手工 1）" % (n_want + 1, n_want))
 
     # 5) 不动别的 hook（比如项目无关的用户级 hook）
     t4 = {"hooks": {"Stop": [{"id": "stop:my-own", "matcher": "*", "hooks": []}]}}
