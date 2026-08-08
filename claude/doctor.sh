@@ -128,7 +128,27 @@ PY
 else
   bad "settings.json 不存在" "python3 ~/dotfiles/claude/merge_settings.py"
 fi
-for h in destructive-command-guard session-change-digest; do
+# 待查的 hook 名**从 settings-permissions.json 现读**，不写死在这里——写死的话每加一个
+# hook 就要记得改两处，而漏改的那次正好是「新 hook 静默缺失、体检却报全绿」（本次差点
+# 发生：加了第三个 hook，条数变 3、逐条核验却仍只查那两个老的）。读不到就退回硬编码兜底。
+_hook_names="$(python3 - "$DOT/claude/settings-permissions.json" <<'PY' 2>/dev/null
+import json, re, sys
+try:
+    d = json.load(open(sys.argv[1], encoding="utf-8"))
+except Exception:
+    sys.exit(1)
+names = []
+for entries in (d.get("hooks") or {}).values():
+    for e in entries:
+        for h in e.get("hooks") or []:
+            m = re.search(r"hooks/([A-Za-z0-9_-]+)\.py", h.get("command") or "")
+            if m and m.group(1) not in names:
+                names.append(m.group(1))
+print(" ".join(names))
+PY
+)"
+[ -n "$_hook_names" ] || _hook_names="destructive-command-guard session-change-digest"
+for h in $_hook_names; do
   p="$HOME/.claude/hooks/$h.py"
   if [ -e "$p" ]; then ok "hook 脚本在：$h.py"
   else bad "hook 脚本缺失/断链：$h.py" "bash ~/dotfiles/install.sh"; fi
