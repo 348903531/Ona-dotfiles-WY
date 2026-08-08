@@ -1,9 +1,7 @@
 {
   "_readme": "要合并进 ~/.claude/settings.json 的**用户级**片段——对你打开的每一个项目生效（不是只对某个仓库）。由 install.sh 调 merge_settings.py 幂等注入，只加这里声明的键，绝不覆盖你已有的 env / 其它设置。来源与全文见 WY-workspace-P 仓库 AGENTS.md 卡#27/#28。",
-
   "_outputStyle_note": "默认输出风格。对应 claude/output-styles/plain-chinese.md（由 install.sh 软链进 ~/.claude/output-styles/）。为什么用 output style 而不是往 CLAUDE.md 里写语气要求：output style 进的是**系统提示词**且全程有 reminder 复述，CLAUDE.md 只是系统提示词之后的一条普通 user message——长会话 auto-compaction 摘要时，「开头交代的语气要求」正是最先被丢的一类（既不最近、又不属于某个具体步骤），于是越聊越漂移回机器腔。该风格设了 keep-coding-instructions: true，只改说话方式、不动写代码能力。合并语义是**缺失才写**：用户在 /config 里换了别的风格，install.sh 重跑不会把他换回来（想恢复默认就把这个键从 ~/.claude/settings.json 删掉）。",
   "outputStyle": "说人话",
-
   "_ask_note": "少数「做完回不去」的操作，无论切到哪种权限模式都必须停下来问一次。为什么放 permissions.ask 而不是只靠 hook：官方文档明文保证 explicit ask rules 在 bypassPermissions 模式下**仍然强制弹窗**（hook 在该模式下的行为文档没写死）——这是唯一有明文保证的确定层。局限（诚实）：ask 是前缀匹配，`cd /x && git reset --hard` 这种藏在 && 后半截的匹配不到，那由 destructive-command-guard hook 用命令位置解析补上。刻意只放这些：放多了就又回到「看不懂、全点 yes」，安全网退化成噪音。",
   "permissions": {
     "ask": [
@@ -29,7 +27,6 @@
       "Bash(sudo:*)"
     ]
   },
-
   "_hooks_note": "两个 hook 用 $HOME 绝对路径（用户级 hook 的工作目录是当前项目，不能用相对路径）。都 fail-open：脚本缺失/报错一律静默放行，绝不卡住工作。在同时装了项目级同名 hook 的仓库里，用户级这份会自动静默让位（见脚本头部 preamble），不会同一件事报两遍。",
   "hooks": {
     "PreToolUse": [
@@ -56,6 +53,17 @@
         ],
         "description": "Session change digest (user-level): 会话收尾从 transcript **自动算出并打印**本轮改动清单（改了哪些文件 / git 提交推送 / 外发上传 / 删除移动，破坏性操作单列加 ⚠️）。放弃逐次事前确认，换来的必须是一次性事后对账，否则就是净损失。刻意由 hook 自己算——「让 agent 记得写清单」是散文级约束会被忘，agent 忘了写清单也照样出现。只读命令一律不收，被拒/失败的调用不记账（不谎报）。按 transcript 行号增量节流，本轮无改动则完全静默。",
         "id": "stop:session-change-digest"
+      },
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "GUARD=\"$HOME/.claude/hooks/unanswered-question-guard.py\"; [ -f \"$GUARD\" ] && python3 \"$GUARD\" || exit 0"
+          }
+        ],
+        "description": "Unanswered-question guard (user-level): 会话收尾从 transcript 抽出用户**这一条消息里提的每个问题**（含无问号的疑问句、祈使形式的请求、上一轮重复问的标 🔁），原样列给 agent 自查。用户 2026-08-08 点名「你回答问题的时候总是漏问题」——当轮实例：问「ADHD 模式默认打开了吗」，我做了却只在表格里塞半句、没正面答。与 todo-silent-drop-guard 同源且更根本：那条防「验收清单被我改窄」，这条防「要答哪几条被我按自己关注点筛过」，都是拿自己动过的东西证明自己做完了。刻意**只抽取、不判断答没答**（语义判断必误报，误报几次提醒就失信）。阈值 ≥2 个问题才响（单问题漏答概率低，报了是噪音）。刻意不设 systemMessage——清单给 agent 自查，不弹给用户刷屏。URL 先挖掉再切句（真实误报：Drive 链接里的 ? 曾让一条消息虚报 6 个问题，是拿 6 个真实会话当基线才照出来的）。fail-open、不 block。",
+        "id": "stop:unanswered-question-guard"
       }
     ]
   }
