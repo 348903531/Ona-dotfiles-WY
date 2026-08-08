@@ -105,11 +105,24 @@ BRANCH_RE = re.compile(r"\bpush\s+(?:-u\s+)?(?:origin|upstream)\s+(?P<b>[\w./-]+
 # heredoc 正文是**数据**不是命令。上线首轮本 hook 就自己踩到：几条 `python3 - <<'PY'`
 # 里的文档文字含 "rm -rf /" 字样，被记成「⚠️ 破坏性操作 ×6」，而 detail 显示的是命令
 # 首行 `cd /workspaces/...`——既误报又没信息量。剥离后只扫命令行本身。
-HEREDOC_RE = re.compile(r"<<-?\s*(['\"]?)([A-Za-z_]\w*)\1.*?^\s*\2\s*$", re.S | re.M)
+#
+# ⚠️ heredoc 正文从**分隔符所在行的下一行**才开始，不是从分隔符后一个字符开始。
+# 初版写成 `\1.*?^\s*\2\s*$` 且带 re.S，`.*?` 会把**同一行上 heredoc 之后的部分**
+# 一起吃掉——而那部分是真命令。实测漏记（2026-08-07，本 hook 自己身上）：
+#     git commit -F - <<'EOF' && git push 2>&1 | tail -2 && git fetch origin
+#     <正文>
+#     EOF
+# 剥离后只剩 `git commit -F - <<HEREDOC_BODY_STRIPPED`，`git push` 凭空消失，
+# 改动清单里就少了一次**外发动作**。这类漏记比误报危险得多：误报你会发现，
+# 漏记你不会——而这份清单正是「不再逐次弹窗确认」换来的唯一对账凭据。
+# 修法：显式吃掉「分隔符 → 行尾」的 rest，再从下一行开始匹配正文，替换时把 rest 还回去。
+HEREDOC_RE = re.compile(
+    r"<<-?\s*(['\"]?)([A-Za-z_]\w*)\1(?P<rest>[^\n]*)\n.*?^\s*\2\s*$", re.S | re.M)
 
 
 def _strip_heredocs(cmd):
-    return HEREDOC_RE.sub("<<HEREDOC_BODY_STRIPPED", cmd)
+    # rest = 与 heredoc 分隔符同行、位于其后的真命令（`&& git push …`），必须保留
+    return HEREDOC_RE.sub(lambda m: "<<HEREDOC_BODY_STRIPPED" + m.group("rest"), cmd)
 
 
 # ── 命令位置解析（与 destructive-command-guard 同源；改一处要同步另一处）──────
@@ -551,11 +564,24 @@ def _selftest():
         if not cond:
             bad += 1
 
+    # ── 依赖 guard 的断言：拿不到 guard 时必须 SKIP，绝不报 FAIL（假红同样有害）──
+    # 本仓一贯强调「SKIP 不许伪装成 PASS」（假绿）。这里是它的**镜像**：把「压根没跑」
+    # 报成 FAIL = **假红**，同样会误导——2026-08-07 实测代价：为了验证一个修复「在没修
+    # 时会不会红」，把脚本拷到 /tmp 跑，guard 不在同目录 → 5 条 destructive 断言全红，
+    # 我一度以为自己把核心逻辑改坏了，白折腾一轮、差点回退掉正确的修复。
+    # 判据一句话：**红要红在「判错了」，不能红在「没跑」。**
+    def want_destructive(cond, desc):
+        if _DESTRUCTIVE_SCAN is None:
+            checks.append(("SKIP", desc + "  ← 未运行：同目录找不到 "
+                                          "destructive-command-guard.py（不是失败）"))
+            return
+        want(cond, desc)
+
     want(len(data["files"]) == 2, "文件去重后为 2（Write 1 + Edit 1，重复的 AGENTS.md 只算一次）")
     want("only-read" not in out and "ls -la" not in out, "只读命令不进清单")
     want("feat: 加闸门" in out, "commit message 被提取")
     want("feat/xyz" in out, "push 分支被提取")
-    want("⚠️ 破坏性操作" in out, "reset --hard 被标为破坏性")
+    want_destructive("⚠️ 破坏性操作" in out, "reset --hard 被标为破坏性")
     want("上传到 Drive" in out, "Drive 上传被收进外发")
     want(last == 10, "读到的行数 = 10（供增量节流用）")
 
@@ -589,6 +615,20 @@ def _selftest():
     want("破坏性" not in out4, "bug1 回归：heredoc 正文里的 rm -rf 不再误报为破坏性操作")
     want("never-written.py" not in out4, "bug2 回归：被拒绝的写入不进改动清单（不谎报）")
 
+    # bug1d（2026-08-07，本 hook 自己漏记）：heredoc 分隔符**同一行后面**的真命令
+    # 被剥离器连带吃掉。上面 bug1 防的是「误报」（正文被当命令），这条防的是反向的
+    # 「漏记」（真命令被当正文）——两个方向都要测，只测一边会长期以为自己是对的。
+    fd4c, path4c = tempfile.mkstemp(suffix=".jsonl")
+    with os.fdopen(fd4c, "w", encoding="utf-8") as fh:
+        fh.write(rec("Bash", {"command":
+            "cd ~/d && git commit -q -F - <<'MSG' && git push -u origin feat/abc "
+            "2>&1 | tail -2 && git fetch -q origin\ndocs: 提交说明正文\nMSG"}) + "\n")
+    out4c = render(collect(path4c, 0)[0])
+    want("git 推送" in out4c,
+         "bug1d 回归：heredoc 同行后面的 git push 仍被记账（外发动作不许漏记）")
+    want("feat/abc" in out4c, "bug1d 回归：漏记修好后分支名也取得到")
+    want("git 提交" in out4c, "bug1d 回归：同条命令里的 commit 照常记账")
+
     # bug1b（第二轮抓到的同类形态）：echo/grep 参数里的危险字样不是破坏性操作
     fd5, path5 = tempfile.mkstemp(suffix=".jsonl")
     with os.fdopen(fd5, "w", encoding="utf-8") as fh:
@@ -605,7 +645,7 @@ def _selftest():
     with os.fdopen(fd6, "w", encoding="utf-8") as fh:
         fh.write(rec("Bash", {"command": 'echo "开始清理" && rm -rf /workspaces/x'}) + "\n")
     data6, _ = collect(path6, 0)
-    want("破坏性" in render(data6), "别修过头：安全段之后的真危险操作仍要记账")
+    want_destructive("破坏性" in render(data6), "别修过头：安全段之后的真危险操作仍要记账")
 
     # bug1d：AST 判定——字符串字面量里的写文件写法不算数（本轮第五种误报形态）
     _ast_cases = [
@@ -674,8 +714,8 @@ def _selftest():
         ("git reset --hard", True, "丢未提交改动"),
         ("git push --force origin main", True, "覆盖远端历史"),
     ]:
-        want(("destructive" in _classify(_cmd)) == _want,
-             "bug1c 判据一致：%s（%s）" % (_cmd[:38], _why))
+        want_destructive(("destructive" in _classify(_cmd)) == _want,
+                         "bug1c 判据一致：%s（%s）" % (_cmd[:38], _why))
 
     # bug1c（第三轮）：真实误报形态——命令位置解析后才根治
     fd7, path7 = tempfile.mkstemp(suffix=".jsonl")
@@ -703,7 +743,17 @@ def _selftest():
 
     for status, desc in checks:
         print("%s %s" % (status, desc))
-    print("\n%d/%d 通过" % (len(checks) - bad, len(checks)))
+    # SKIP 必须从「通过」里扣出来单独说。把「压根没跑」算进分子 = 假绿，正是本仓
+    # 反复防的那件事——刚为了修「假红」引入 SKIP 档，差点顺手造出一个假绿：
+    # 8 条 SKIP 时汇总仍显示「34/34 通过」，读起来像全验过了。
+    skipped = sum(1 for s, _ in checks if s == "SKIP")
+    total = len(checks)
+    passed = total - bad - skipped
+    if skipped:
+        print("\n%d/%d 通过，%d 项 FAIL，⚠️ %d 项 SKIP（**未验证**，别当通过）"
+              % (passed, total, bad, skipped))
+    else:
+        print("\n%d/%d 通过" % (passed, total))
     if bad == 0:
         print("\n--- 渲染样例 ---\n" + out)
     for p in (path, path2):
@@ -711,7 +761,12 @@ def _selftest():
             os.unlink(p)
         except Exception:
             pass
-    return 1 if bad else 0
+    # 退出码三档，沿用本仓惯例：0=真绿 / 1=判错了，必须修 / 3=有项目没跑，别当验过。
+    # 三档而非两档的理由与 office_sdk_validate 等闸门一致——「可重试的环境缺料」和
+    # 「输入本身错了」混成同一个码，前者会把后者静默吞掉。
+    if bad:
+        return 1
+    return 3 if skipped else 0
 
 
 if __name__ == "__main__":
