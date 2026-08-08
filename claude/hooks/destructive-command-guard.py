@@ -102,6 +102,7 @@ if _proj and _os.path.isfile(
         _os.path.join(_proj, ".claude", "hooks", _os.path.basename(__file__))):
     _sys.exit(0)          # 项目级已装同名 hook → 让它来，避免同一件事报两遍
 
+import ast
 import json
 import os
 import re
@@ -317,6 +318,88 @@ def _git_subcommand(args):
     return "", []
 
 
+# 会把字符串**当命令执行**的函数：危险与否取决于参数内容
+_EXEC_FUNCS = {"system", "popen", "run", "call", "check_call", "check_output",
+               "Popen", "spawn", "spawnl", "spawnv", "execv", "execvp", "execl",
+               "getoutput", "getstatusoutput"}
+# **函数本身就是破坏性删除**：不看参数，出现即危险。
+# 刻意不含 rename / replace —— os.replace 是原子写入的标准手法（本仓多处在用），
+# 判它危险会天天误报；也不含 copy* / move（可逆）。
+_DESTRUCTIVE_FUNCS = {"remove", "unlink", "rmtree", "rmdir", "removedirs", "truncate"}
+
+
+def _python_exec_danger(head, args):
+    """判 `python -c "<code>"`：'inert'（确认惰性）/ 'danger'（确认危险）/ None（判不出）。
+
+    背景：对 CODE_ARG_HEADS 退回文本扫描是有道理的——`python3 -c
+    "os.system('rm -rf /')"` 必须拦得住。代价是它分不清代码和数据：
+    把 'git checkout -- a.md' 当**测试输入字符串**打印出来，也会被当成真要执行，
+    于是弹一次窗。2026-08-08 实测：一轮里两条纯只读的诊断命令全被标破坏性——
+    这正是用户最烦的那种「看不懂、只会点 yes」的无意义打断。
+
+    做法：把 -c 的代码用 AST 解析，只看**危险字样有没有落在会真正执行它的位置**：
+    · 落在 os.system / subprocess.* 的参数里 → 'danger'
+    · 调了 os.remove / shutil.rmtree 这类**本身即删除**的函数 → 'danger'
+    · 只是列表元素、print 参数、赋给变量的字面量 → 'inert'
+
+    **判不出一律 None（退回文本扫描）**：解析失败、不是 python、没有 -c、
+    出现 eval/exec/compile 这类静态追不了的间接执行渠道。降噪只作用于「已确证
+    无关」，绝不作用于「判不出」——这是本轮反复确认的判据。
+
+    三态而不是二态的原因：写这条时用两个真实漏洞验出来的——
+    `subprocess.run(['rm','-rf','/x'])` 把命令拆成列表元素，文本扫描的
+    `\\brm\\s+-\\w*[rR]` 要求 rm 后跟空格，拆开后匹配不到；`shutil.rmtree(...)`
+    文本层压根没有对应模式。两者都是**原有漏洞**，只退回文本扫描等于放行。
+    所以 AST 层必须能主动报危险，不能只会说「我判不出、你去文本扫」。
+    """
+    if head not in ("python", "python3", "python2"):
+        return None
+    if "-c" not in args:
+        return None
+    i = args.index("-c")
+    if i + 1 >= len(args):
+        return None
+    src = args[i + 1]
+    try:
+        tree = ast.parse(src)
+    except (SyntaxError, ValueError):
+        return None                       # 解析不了 → 交回文本扫描
+    for node in ast.walk(tree):
+        # 间接执行渠道：静态追踪不了，从严
+        if isinstance(node, ast.Name) and node.id in ("eval", "exec", "compile"):
+            return None
+    any_str = any(isinstance(n, ast.Constant) and isinstance(n.value, str)
+                  for n in ast.walk(tree))
+    saw_call = False
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        f = node.func
+        name = f.attr if isinstance(f, ast.Attribute) else (
+            f.id if isinstance(f, ast.Name) else "")
+        if name in _DESTRUCTIVE_FUNCS:
+            return "danger"               # 函数本身就是删除，不看参数
+        if name not in _EXEC_FUNCS:
+            continue
+        saw_call = True
+        # 参数不是字面量（变量拼出来的）→ 静态看不见，从严
+        if not any(isinstance(a, ast.Constant) for a in ast.walk(node)):
+            return None
+        payload = " ".join(a.value for a in ast.walk(node)
+                           if isinstance(a, ast.Constant)
+                           and isinstance(a.value, str))
+        for _name, rx, _why in PATTERNS:
+            if rx.search(payload):
+                return "danger"
+        if CODE_RM_RE.search(payload) or DRIVE_DELETE_RE.search(payload):
+            return "danger"
+    if saw_call:
+        return None                       # 有执行调用但没判出危险 → 交回文本扫描
+    if not any_str:
+        return None                       # 没字符串可判 → 交回文本扫描
+    return "inert"                        # 只有数据、没有任何执行调用
+
+
 def _judge_unit(head, args):
     """对**一个命令位置**做结构化判定，返回 [(标识, 中文说明), …]。"""
     hits = []
@@ -385,7 +468,18 @@ def _judge_unit(head, args):
         if head == "killall" or "-f" in args:
             hits.append(("pkill-f", _WHY["pkill-f"]))
     elif head in CODE_ARG_HEADS:
-        # 参数即代码（不同于 echo 的参数是文本）→ 只能退回文本级扫描
+        # 参数即代码（不同于 echo 的参数是文本）→ 只能退回文本级扫描。
+        # **但对 python 先用 AST 精确化**（见 _python_code_is_inert 的说明）：
+        # 纯数据的代码（把危险命令当字符串打印/存进列表）不该拦，那是纯打断。
+        _v = _python_exec_danger(head, args)
+        if _v == "inert":
+            return hits                   # 确认是纯数据 → 放行，别做无意义打断
+        if _v == "danger":
+            hits.append(("code-exec-destructive",
+                         "这段 **%s -c** 代码会真的执行破坏性操作（删文件 / 跑 rm / "
+                         "调删除 API）。AST 已确认危险字样落在会被执行的位置上，"
+                         "不是当字符串打印。做完找不回来。" % head))
+            return hits
         for name, rx, why in PATTERNS:
             if rx.search(joined):
                 hits.append((name, why))
@@ -432,6 +526,100 @@ def _reason(hits):
     return head + body + tail
 
 
+_PATHISH_RE = re.compile(r"[\w.\-/~$]{2,}")
+
+
+def _targets(cmd):
+    """从命令里挑出「像操作目标」的 token（路径 / 文件名 / 分支名）。
+
+    只做粗筛：去掉 flag、命令名、纯符号。用于判断 agent 有没有在对话里点过名。
+    """
+    out = []
+    try:
+        units = _command_units(_strip_heredocs(cmd)) or []
+    except Exception:
+        return out
+    for head, args in units:
+        for a in args:
+            if a.startswith("-") or a in ("&&", "||", ";", "|", ">", ">>", "--"):
+                continue
+            if not _PATHISH_RE.fullmatch(a):
+                continue
+            if a in ("origin", "upstream", "HEAD", "."):
+                continue
+            out.append(a)
+    return out
+
+
+def _said_in_chat(transcript_path, targets):
+    """agent 有没有在**最近一条回复正文**里点名过这些目标。
+
+    用户 2026-08-08 定的形态：「涉及关键文件删除/修改的确认非常有必要，但要在
+    **对话里**确认，而不是弹 bash 界面。对话里面你更多的是告诉我干什么。」
+
+    所以这道 hook 从「执行那一刻拦住用户」改成「执行前检查 agent 有没有先交代」：
+    · 交代过 → 放行，不弹窗（用户已经在对话正文里读到并可以叫停）
+    · 没交代 → 照旧 ask，且正文改成「你还没在对话里说清楚」——**惩罚落在 agent
+      身上，不是打扰用户**。
+
+    只看**最后一条** assistant 文本：早几轮说过的不算，用户当下未必还记得。
+    只认 type=="text"（用户看得见的正文），不认 thinking——用户看不见思考，
+    那不构成告知。同一判据在 session-change-digest 的降噪里已验证可用。
+
+    读不到 transcript / 没有目标可核 → 返回 False（照旧弹窗）。**故意保守**：
+    判不出时要退回更安全的一侧，这是本轮刚沉淀的教训——降噪只能作用于「已确证
+    无关」的东西，不能作用于「判不出」的东西。
+    """
+    if not transcript_path or not targets:
+        return False
+    last = ""
+    try:
+        with open(transcript_path, encoding="utf-8") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    d = json.loads(line)
+                except Exception:
+                    continue
+                if d.get("type") != "assistant":
+                    continue
+                msg = d.get("message") or {}
+                content = msg.get("content")
+                if not isinstance(content, list):
+                    continue
+                chunks = [b.get("text") or "" for b in content
+                          if isinstance(b, dict) and b.get("type") == "text"]
+                if chunks:
+                    last = "\n".join(chunks)          # 只保留最后一条，前面的覆盖掉
+    except Exception:
+        return False
+    if not last:
+        return False
+    # 每个目标都要被点到名（basename 命中即可——回复里通常写文件名而非全路径）
+    for t in targets:
+        base = os.path.basename(t.rstrip("/")) or t
+        if base and base in last:
+            continue
+        if t in last:
+            continue
+        return False
+    return True
+
+
+_NOT_SAID_HINT = (
+    "\n\n──────────\n"
+    "⚠️ **你还没在对话正文里交代这次操作**。按用户 2026-08-08 的要求："
+    "涉及删除/覆盖关键文件的确认要**在对话里用人话说清楚**，而不是靠这个弹窗——"
+    "他看不懂原始命令，弹了也只会点 yes，等于没确认。\n\n"
+    "**先回到对话里说清楚这几件事，再执行**：\n"
+    "① 具体动哪些东西（列出来，给个数）；② 做完能不能找回来；"
+    "③ 这条指令**有没有第二种理解**——有就把几种理解列出来让用户选，别替他猜。\n\n"
+    "说清楚之后再跑同一条命令，本 hook 会自动放行、不再打扰他。"
+)
+
+
 def main():
     try:
         payload = json.load(sys.stdin)
@@ -448,11 +636,19 @@ def main():
         sys.exit(0)                                    # fail-open
     if not hits:
         sys.exit(0)
+    # 先在对话里交代过 → 放行。用户已经在正文里读到、有机会叫停，再弹一次就是
+    # 他说的「反复确认、增加工作量」。permissions.ask 里那 11 条仍在更外层兜底，
+    # 那是官方保证在任何模式下都会弹的确定层，本 hook 放行不影响它。
+    try:
+        if _said_in_chat(payload.get("transcript_path"), _targets(cmd)):
+            sys.exit(0)
+    except Exception:
+        pass                                           # 判不出就照旧弹窗
     out = {
         "hookSpecificOutput": {
             "hookEventName": "PreToolUse",
             "permissionDecision": "ask",
-            "permissionDecisionReason": _reason(hits),
+            "permissionDecisionReason": _reason(hits) + _NOT_SAID_HINT,
         }
     }
     print(json.dumps(out, ensure_ascii=False))
@@ -532,6 +728,22 @@ SELFTEST = [
     ('mkdir -p /tmp/g && cp .claude/hooks/destructive-command-guard.py /tmp/g/', False),
     # 参数即代码的 head 仍要扫到（回归测试抓到过漏拦）
     ('python3 -c "import os; os.system(\'rm -rf /\')"', True),
+
+    # ── python -c：区分「代码」与「数据」（2026-08-08 用户点名的误报）─────────
+    # 退回文本扫描会把「把危险命令当字符串打印/存列表」也当成真要执行，于是弹一次
+    # 无意义的窗。实测一轮里两条纯只读的诊断命令全被标破坏性。现用 AST 精确化。
+    # 必须成对验：惰性的放行（下面 False 组）+ 真执行的照拦（True 组）——只验一边
+    # 会让「一律放行」这种退化也全绿。
+    ('python3 -c "for c in [\'git checkout -- a.md\']: print(c)"', False),
+    ('python3 -c "print(\'rm -rf /workspaces/x\')"', False),
+    ('python3 -c "cases = [\'git reset --hard\', \'git clean -fd\']; print(len(cases))"', False),
+    ('python3 -c "import os; os.system(\'git checkout -- a.md\')"', True),
+    ('python3 -c "import subprocess; subprocess.run([\'rm\', \'-rf\', \'/x\'])"', True),
+    ('python3 -c "import shutil; shutil.rmtree(\'/workspaces/out\')"', True),
+    # 间接执行渠道静态追不了 → 从严照拦（判不出不许放行）
+    ('python3 -c "import os; c=\'rm -rf /x\'; eval(\'os.system(c)\')"', True),
+    # 参数不是字面量（变量拼出来）→ 同样从严
+    ('python3 -c "import os; c=\'rm -rf /x\'; os.system(c)"', True),
 ]
 
 
@@ -543,7 +755,62 @@ def _selftest():
         if not ok:
             bad += 1
         print("%s  want=%-5s got=%-5s  %s" % ("OK " if ok else "FAIL", want, got, cmd))
-    print("\n%d/%d 通过" % (len(SELFTEST) - bad, len(SELFTEST)))
+    total = len(SELFTEST)
+
+    # ── 「先在对话里说清楚才放行」层（用户 2026-08-08 定的确认形态）─────────
+    # 这层判的不是命令危不危险（上面 SELFTEST 已覆盖），而是**弹不弹窗**：
+    # agent 已在回复正文里点过名 → 放行；没点名 → 照旧 ask。
+    import tempfile
+
+    def _mk_transcript(assistant_texts):
+        fd, p = tempfile.mkstemp(suffix=".jsonl")
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            for t in assistant_texts:
+                fh.write(json.dumps({"type": "assistant", "message": {
+                    "role": "assistant",
+                    "content": [{"type": "text", "text": t}]}},
+                    ensure_ascii=False) + "\n")
+        return p
+
+    def chk(cond, desc):
+        nonlocal bad, total
+        total += 1
+        if not cond:
+            bad += 1
+        print("%s  %s" % ("OK " if cond else "FAIL", desc))
+
+    CMD = "rm -rf /workspaces/proj/out"
+    p_said = _mk_transcript(["先说一句无关的。", "我要删掉 out 这个目录，里面是旧产物。"])
+    p_mute = _mk_transcript(["我先看一下代码结构。"])
+    # 早几轮说过、最近一条没说 → 不算（用户当下未必还记得）
+    p_stale = _mk_transcript(["我要删掉 out 目录。", "现在改别的文件。"])
+    chk(_said_in_chat(p_said, _targets(CMD)) is True,
+        "A① 回复正文里点过名 → 放行（不再弹窗）")
+    chk(_said_in_chat(p_mute, _targets(CMD)) is False,
+        "A② 回复里没交代 → 照旧 ask")
+    chk(_said_in_chat(p_stale, _targets(CMD)) is False,
+        "A③ 只有早几轮说过、最近一条没说 → 不算交代过")
+    chk(_said_in_chat(None, _targets(CMD)) is False,
+        "A④ 拿不到 transcript → 保守，照旧 ask（判不出不许放行）")
+    chk(_said_in_chat(p_said, []) is False,
+        "A⑤ 挑不出操作目标 → 保守，照旧 ask")
+    # thinking 块不算「告诉过用户」——用户看不见思考
+    fd_t, p_think = tempfile.mkstemp(suffix=".jsonl")
+    with os.fdopen(fd_t, "w", encoding="utf-8") as fh:
+        fh.write(json.dumps({"type": "assistant", "message": {"role": "assistant",
+                 "content": [{"type": "thinking", "thinking": "我要删 out 目录"}]}},
+                 ensure_ascii=False) + "\n")
+    chk(_said_in_chat(p_think, _targets(CMD)) is False,
+        "A⑥ 只在思考块里提到不算交代（用户看不见思考）")
+    # 多目标：必须**每个**都点过名，漏一个就不算
+    CMD2 = "rm -rf /w/alpha /w/beta"
+    p_half = _mk_transcript(["我要删掉 alpha 目录。"])
+    chk(_said_in_chat(p_half, _targets(CMD2)) is False,
+        "A⑦ 多个目标只交代了一个 → 不算（漏的那个用户不知情）")
+    for _p in (p_said, p_mute, p_stale, p_think, p_half):
+        os.unlink(_p)
+
+    print("\n%d/%d 通过" % (total - bad, total))
     return 1 if bad else 0
 
 
