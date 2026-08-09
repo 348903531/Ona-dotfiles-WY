@@ -128,10 +128,15 @@ def audit(settings):
 # 症状长这样：模式菜单里**根本没有 Bypass permissions 这一项**（不是没选中），而
 # 配置侧三项全绿、--check 全过。
 VSCODE_MACHINE_SETTINGS = [
-    ("桌面 VS Code（Remote 连进容器）", "~/.vscode-server/data/Machine/settings.json"),
-    ("Ona 网页版 VS Code", "~/.vscode-browser-server/data/Machine/settings.json"),
+    ("桌面 VS Code（Remote 连进容器）",
+     "~/.vscode-server/data/Machine/settings.json",
+     "~/.vscode-server/extensions"),
+    ("Ona 网页版 VS Code",
+     "~/.vscode-browser-server/data/Machine/settings.json",
+     "~/.vscode-browser-server/extensions"),
 ]
 VSCODE_TOGGLE = "claudeCode.allowDangerouslySkipPermissions"
+CC_EXT_PREFIX = "anthropic.claude-code"
 
 
 def vscode_toggle_missing():
@@ -144,15 +149,21 @@ def vscode_toggle_missing():
     延后一层，性质不变，同样不做。缺了怎么办 → 报出来 + 给精确到标签页的 GUI 路径，
     由用户自己点那一下。
 
-    只统计**该侧 server 目录已存在**的（从没用过网页版就不该报它缺，否则纯噪音）。
+    **判据是「这一侧装了 Claude Code 扩展吗」，不是「这一侧的 server 目录在吗」**
+    （2026-08-09 当场改的：初版按目录判，于是网页版侧被报缺——可那侧根本没装 Claude Code
+    扩展、压根不会跑 Claude，报它纯属噪音。dotfiles 的 extensions.txt 也刻意没把
+    anthropic.claude-code 放进跨项目清单。**提醒只在「这一侧真会用到它」时才响**，
+    否则用户每开一个窗口都被弹一次没用的，提醒很快就失信。）
     """
     missing = []
-    for label, rel in VSCODE_MACHINE_SETTINGS:
-        path = os.path.expanduser(rel)
-        server_root = os.path.dirname(os.path.dirname(os.path.dirname(path)))
-        if not os.path.isdir(server_root):
-            continue
-        d = _load(path, {})
+    for label, rel, ext_dir in VSCODE_MACHINE_SETTINGS:
+        try:
+            names = os.listdir(os.path.expanduser(ext_dir))
+        except Exception:
+            continue                               # 这一侧不存在 / 读不到
+        if not any(n.startswith(CC_EXT_PREFIX) for n in names):
+            continue                               # 这一侧没装 Claude Code，不关它的事
+        d = _load(os.path.expanduser(rel), {})
         if not isinstance(d, dict) or d.get(VSCODE_TOGGLE) is not True:
             missing.append((label, rel))
     return missing
@@ -261,6 +272,33 @@ def build_report(fixed, proj_ask, bumped, old_v, new_v, vsc_missing=()):
     return "\n".join(lines)
 
 
+def build_user_message(vsc_missing):
+    """**给用户自己看**的那条（hook 输出的顶层 `systemMessage`），不是给 agent 的。
+
+    为什么必须单独有这一条（2026-08-09 用户点名）：本 hook 初版只写 `additionalContext`,
+    那是**注入给 agent 的上下文、用户根本看不见**。于是「开机自动提醒」只做到一半——
+    agent 知道了，唯一能动手的人不知道，用户照旧是「用了半天才发现被降级成 Auto」。
+    用户原话：「新进窗口的时候你能自动提醒我……别让我事后才发现。」
+
+    只在**这一侧真装了 Claude Code、且开关确实没勾**时才出现；勾上了立刻不再打扰。
+    刻意写得短、每一步都能照着点——用户看的东西不能是长篇大论，否则他会开始略过它。
+    """
+    if not vsc_missing:
+        return None
+    return (
+        "⚠️  Bypass 模式现在用不了 —— VS Code 里那个准入开关没勾，"
+        "所以模式菜单里不会出现 Bypass permissions，只能停在 Auto，Bash 命令会一条条问你。\n"
+        "怎么勾（30 秒）：\n"
+        "  1. 按 Ctrl+,  打开设置\n"
+        "  2. 搜索框粘：allowDangerouslySkipPermissions\n"
+        "  3. 上方三个标签页 User / Remote [Dev Container] / Workspace —— "
+        "**点中间的 Remote [Dev Container]**（点 User 没用）\n"
+        "  4. 勾上，然后 Ctrl+Shift+P 输入 Reload Window\n"
+        "不想勾也行：在终端里直接敲 claude，终端版不经过这个开关、本来就是免弹窗的。\n"
+        "（容器重建后这个勾会消失，那时我会再提醒你一次。）"
+    )
+
+
 def run_hook():
     settings = _load(SETTINGS, None)
     if settings is None or not isinstance(settings, dict):
@@ -282,15 +320,25 @@ def run_hook():
     if bumped:
         _remember(new_v)
 
-    report = build_report(fixed, project_ask(proj), bumped, old_v, new_v,
-                          vscode_toggle_missing())
+    vsc = vscode_toggle_missing()
+    report = build_report(fixed, project_ask(proj), bumped, old_v, new_v, vsc)
+    user_msg = build_user_message(vsc)
+
+    # 两个出口，喂给两拨人，别混：
+    #   additionalContext → 注入给 **agent** 的上下文（用户看不见）
+    #   systemMessage     → 直接显示给 **用户**（agent 看不见）
+    # 只有用户点得了那个开关，所以这一条必须走 systemMessage —— 初版只写前者，
+    # 等于「提醒了唯一帮不上忙的那个人」。
+    out = {}
     if report:
-        print(json.dumps({
-            "hookSpecificOutput": {
-                "hookEventName": "SessionStart",
-                "additionalContext": report,
-            }
-        }, ensure_ascii=False))
+        out["hookSpecificOutput"] = {
+            "hookEventName": "SessionStart",
+            "additionalContext": report,
+        }
+    if user_msg:
+        out["systemMessage"] = user_msg
+    if out:
+        print(json.dumps(out, ensure_ascii=False))
     return 0
 
 
