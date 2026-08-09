@@ -49,6 +49,20 @@ TOP_LEVEL_SCALARS = ("outputStyle",)
 # 想恢复默认，把这个键从 ~/.claude/settings.json 删掉，下次 install 会补回。
 PERMISSION_SCALARS = ("defaultMode",)
 
+# `sandbox` 下的标量键：同样**只在缺失时写入，绝不覆盖**。
+# 为什么需要这一族（2026-08-09 实测定位）：Bash 沙箱是**独立于 permissions 的第三层**，
+# `defaultMode: bypassPermissions` 完全管不到它。沙箱按操作系统边界放行命令——
+# 读全盘 OK、**写只限当前工作目录**、**网络只限白名单域名**；越界的命令不是被拒，
+# 而是回落到权限流程去**弹窗**。于是即便 bypass 已开、ask 只剩 11 条，
+# `git fetch origin`（联网）、`… > /tmp/x`（写工作目录外）这类日常命令仍会逐条弹确认框。
+# 用户 2026-08-08 已明确「弹窗我看不懂、只会点 yes，不如别问、事后对账」，
+# 沙箱制造的弹窗与该决定直接冲突，且它拦的恰恰是最日常的两类操作，噪音极大。
+# 关掉它的净风险增量约等于零：bypassPermissions 官方已声明对提示词注入零防护，
+# 沙箱在这个组合下只剩「制造弹窗」的副作用；且本工作台是隔离 devcontainer。
+# 想收紧回去：把 ~/.claude/settings.json 里 sandbox.enabled 改回 true（或删掉本键
+# 再把片段里的值改成 true）——install.sh 是「缺失才写」，不会把你改回来。
+SANDBOX_SCALARS = ("enabled",)
+
 
 def _load(path, default):
     if not os.path.isfile(path):
@@ -96,6 +110,20 @@ def merge(target, frag):
         perms = target.setdefault("permissions", {})
         if "_defaultMode_note" not in perms:
             perms["_defaultMode_note"] = frag_perms["_defaultMode_note"]
+            changed = True
+
+    # ── sandbox 下的标量键（enabled）：缺失才写，已有则尊重 ──────────────
+    frag_sbx = frag.get("sandbox") or {}
+    for key in SANDBOX_SCALARS:
+        if key in frag_sbx:
+            sbx = target.setdefault("sandbox", {})
+            if key not in sbx:
+                sbx[key] = frag_sbx[key]
+                changed = True
+    if "_enabled_note" in frag_sbx:
+        sbx = target.setdefault("sandbox", {})
+        if "_enabled_note" not in sbx:
+            sbx["_enabled_note"] = frag_sbx["_enabled_note"]
             changed = True
 
     # ── 顶层标量键（outputStyle）：缺失才写，已有则尊重用户的选择 ────────
@@ -197,7 +225,9 @@ def _selftest():
     # 1) 空目标 → 全量写入
     t = {}
     merge(t, frag)
-    want(len(t["permissions"]["ask"]) == n_want,
+    # 用 .get 取：2026-08-09 ask 清零后，合并结果里**根本不会再有 ask 键**
+    # （merge 只在 merged != have 时才写，空数组合空数组无变化），硬取会 KeyError。
+    want(len(t.get("permissions", {}).get("ask", [])) == n_want,
          "空目标：%d 条 ask 全部写入" % n_want)
     want("PreToolUse" in t["hooks"] and "Stop" in t["hooks"], "两个 hook 事件都写入")
 
@@ -224,6 +254,19 @@ def _selftest():
     want(t_mode["permissions"]["defaultMode"] == "plan",
          "用户已设的 permissions.defaultMode 不被覆盖")
     want(changed_mode is True, "跳过 defaultMode 后其它键仍照常写入")
+
+    # 2d) sandbox.enabled：与 defaultMode 同族的第三层开关（Bash 沙箱），语义同样是
+    #     「缺失才写、已有不覆盖」。必须单独验而不是信「反正走的是同一段循环」——
+    #     它走的是**另一个**常量族（SANDBOX_SCALARS）和另一个 setdefault 分支，
+    #     那段代码可以整个删掉而上面的测试全绿（本仓踩过：变异测试要验「把被测逻辑
+    #     整个删掉会不会红」，不红说明用例根本没跑到那段）。
+    want(t.get("sandbox", {}).get("enabled") is False,
+         "空目标：sandbox.enabled 写入 false（关掉 Bash 沙箱，止住越界命令弹窗）")
+    t_sbx = {"sandbox": {"enabled": True}}
+    changed_sbx = merge(t_sbx, frag)
+    want(t_sbx["sandbox"]["enabled"] is True,
+         "用户已开的 sandbox.enabled 不被覆盖")
+    want(changed_sbx is True, "跳过 sandbox.enabled 后其它键仍照常写入")
 
     # 3) 不碰已有的 env（最关键——那里有不能丢的内网代理与 PII）
     t2 = {"env": {"ANTHROPIC_BASE_URL": "http://proxy", "X": "keep me"}}

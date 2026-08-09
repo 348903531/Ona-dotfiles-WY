@@ -2,23 +2,16 @@
   "_readme": "要合并进 ~/.claude/settings.json 的**用户级**片段——对你打开的每一个项目生效（不是只对某个仓库）。由 install.sh 调 merge_settings.py 幂等注入，只加这里声明的键，绝不覆盖你已有的 env / 其它设置。来源与全文见 WY-workspace-P 仓库 AGENTS.md 卡#27/#28。",
   "_outputStyle_note": "默认输出风格。对应 claude/output-styles/plain-chinese.md（由 install.sh 软链进 ~/.claude/output-styles/）。为什么用 output style 而不是往 CLAUDE.md 里写语气要求：output style 进的是**系统提示词**且全程有 reminder 复述，CLAUDE.md 只是系统提示词之后的一条普通 user message——长会话 auto-compaction 摘要时，「开头交代的语气要求」正是最先被丢的一类（既不最近、又不属于某个具体步骤），于是越聊越漂移回机器腔。该风格设了 keep-coding-instructions: true，只改说话方式、不动写代码能力。合并语义是**缺失才写**：用户在 /config 里换了别的风格，install.sh 重跑不会把他换回来（想恢复默认就把这个键从 ~/.claude/settings.json 删掉）。",
   "outputStyle": "说人话",
-  "_ask_note": "【2026-08-08 用户要求砍短：20 → 11 条】用户原话「问我我也判断不了，一定会点 yes，问了没意义」——这个论点成立：如果答案恒为 yes，弹窗提供零安全价值、纯打断成本。**改用的判据不是「危不危险」，而是「对账清单打出来时，这事还救不救得回来」**：救得回来的（reset --hard / branch -D / stash drop|clear 有 reflog 或会打印可 apply 的 sha；filter-branch 留 refs/original；reflog expire 不动当前对象；push --force-with-lease 自带「远端被别人动过就拒绝」的保险；release delete 可重发；sudo 在容器内、坏了 rebuild）→ **砍掉**，交给收尾的 session-change-digest 事后对账。救不回来的（rm -rf / rm -fr / shred / mkfs 删文件擦盘；git clean -f|-d 删的是还没进 git 的新文件、**没有回收站**；push --force|-f|--mirror|--delete 改写远端历史、共享工作区里会冲掉同事的活；gh repo delete 删整个仓库）→ **保留**，因为事后对账**来不及**，清单只能告诉你「东西已经没了」。为什么放 permissions.ask 而不是只靠 hook：官方文档明文保证 explicit ask rules 在 bypassPermissions 模式下**仍然强制弹窗**（hook 在该模式下的行为文档没写死）——这是唯一有明文保证的确定层。局限（诚实）：ask 是前缀匹配，`cd /x && rm -rf y` 这种藏在 && 后半截的匹配不到，那由 destructive-command-guard hook 用命令位置解析补上。**实际打断频率**：这 11 条在日常医学材料/脚本/PR 工作里几乎不触发（用不到 rm -rf、mkfs），量级是几周一次，不是每次都问。想彻底清零就把本数组清空——代价是删错了只能靠已推送的远端版本找回。",
+  "_ask_note_2026_08_09": "【2026-08-09 用户要求清零：11 → 0 条】用户原话「这种不断的提醒只会拖慢我执行任务的节奏，因为你问我，我确实也看不懂……能不能这些弹窗都不允许弹，或者都默认是 yes，你就继续执行完事就行了」。这是 08-08「20→11」那次砍短的同一逻辑走到底：**如果答案恒为 yes，弹窗提供零安全价值、纯打断成本**——08-08 保留 11 条的理由是「救不回来的要拦」，但实测这 11 条在日常里恰恰照弹（本轮实证：`git push --delete` 与 `git branch -D` 各弹一次，全是收尾清理已合并分支这种例行动作），而用户看着原始命令依然只能点 yes，安全价值并未兑现。**安全网没有消失，只是换了层**：① `destructive-command-guard` hook 仍在，它专拦「做完回不去」的命令，且判据是**回看对话正文有没有交代过**——交代过就放行、没交代才用中文人话问一次，正是用户 2026-08-08 定的「确认要在对话里做、不在弹窗里做」；② 收尾 `session-change-digest` hook 自动打印本轮全部改动供事后对账，发现不对再回溯。**想恢复**：把要拦的条目从下面 _ask_retired 里挪回本文件 permissions.ask 数组，并从 ~/.claude/settings.json 手工删掉同名条目（退役是「存在即移除」，光挪回来会被当场删掉）。",
+  "_ask_note": "【2026-08-08 用户要求砍短：20 → 11 条；2026-08-09 已进一步清零，本段保留作沿革】用户原话「问我我也判断不了，一定会点 yes，问了没意义」——这个论点成立：如果答案恒为 yes，弹窗提供零安全价值、纯打断成本。**改用的判据不是「危不危险」，而是「对账清单打出来时，这事还救不救得回来」**：救得回来的（reset --hard / branch -D / stash drop|clear 有 reflog 或会打印可 apply 的 sha；filter-branch 留 refs/original；reflog expire 不动当前对象；push --force-with-lease 自带「远端被别人动过就拒绝」的保险；release delete 可重发；sudo 在容器内、坏了 rebuild）→ **砍掉**，交给收尾的 session-change-digest 事后对账。救不回来的（rm -rf / rm -fr / shred / mkfs 删文件擦盘；git clean -f|-d 删的是还没进 git 的新文件、**没有回收站**；push --force|-f|--mirror|--delete 改写远端历史、共享工作区里会冲掉同事的活；gh repo delete 删整个仓库）→ **保留**，因为事后对账**来不及**，清单只能告诉你「东西已经没了」。为什么放 permissions.ask 而不是只靠 hook：官方文档明文保证 explicit ask rules 在 bypassPermissions 模式下**仍然强制弹窗**（hook 在该模式下的行为文档没写死）——这是唯一有明文保证的确定层。局限（诚实）：ask 是前缀匹配，`cd /x && rm -rf y` 这种藏在 && 后半截的匹配不到，那由 destructive-command-guard hook 用命令位置解析补上。**实际打断频率**：这 11 条在日常医学材料/脚本/PR 工作里几乎不触发（用不到 rm -rf、mkfs），量级是几周一次，不是每次都问。想彻底清零就把本数组清空——代价是删错了只能靠已推送的远端版本找回。",
   "permissions": {
     "_defaultMode_note": "新会话起步用哪种权限模式。设 bypassPermissions 的原因（用户 2026-08-08 明确要求）：技术执行类弹窗（原始 shell 命令 / diff）用户看不懂、每次只能点 yes，等于净打断——改成「不逐次事前确认，换一次性事后对账」（收尾由 session-change-digest hook 自动打印本轮全部改动，用户按清单复核，不对再回溯）。**为什么这个键能做到「跨项目、跨容器永久生效」**：官方文档 permission-modes 明文 “Enable it at launch with permissions.defaultMode: \"bypassPermissions\" in settings”，即写进用户级 settings 就是持久默认，**不需要每次开会话手动切**（早先仓库里记的「必须每次启动时启用」是读错了——原文只是说不能在会话**中途**切进去）。**代价，用户已知情**：该模式对提示词注入零防护，官方要求只在隔离容器/VM/devcontainer 里用——本工作台正是 devcontainer，符合推荐条件。**仍会弹的三类，刻意保留**：① 下面 ask 数组那些做完回不去的操作（官方保证 explicit ask rules 在本模式下仍强制弹窗）；② rm -rf / 与 rm -rf ~ 的内置熔断；③ 组织策略把本模式禁掉时自动退回。**VS Code 扩展侧还要用户自己勾一次** Allow dangerously skip permissions（extension setting claudeCode.allowDangerouslySkipPermissions），agent 无权代劳——那属自我授权，安全分类器硬拒。**想收紧回去**：把本键改成 default / plan / auto 即可，install.sh 是「缺失才写」，不会把你改回来。",
     "defaultMode": "bypassPermissions",
-    "ask": [
-      "Bash(git push --force:*)",
-      "Bash(git push -f:*)",
-      "Bash(git push --mirror:*)",
-      "Bash(git push --delete:*)",
-      "Bash(git clean -f:*)",
-      "Bash(git clean -d:*)",
-      "Bash(rm -rf:*)",
-      "Bash(rm -fr:*)",
-      "Bash(shred:*)",
-      "Bash(mkfs:*)",
-      "Bash(gh repo delete:*)"
-    ]
+    "ask": []
+  },
+  "sandbox": {
+    "_enabled_note": "【2026-08-09 定位并关闭】Bash 沙箱是**独立于 permissions 的第三层**——`defaultMode: bypassPermissions` 管不到它。症状：两个开关都设对了、doctor 全绿、transcript 里 permissionMode 确实是 bypassPermissions，日常命令仍在弹「Allow this bash command?」。实测对照定死了边界：写工作目录内 → 不弹；写 /tmp（工作目录外）→ 弹；`git fetch origin`（联网）→ 弹；读全盘 → 不弹。这正是官方文档写的沙箱语义：读全盘允许、**写只限 cwd + session temp**、**网络只限白名单**，越界命令回落到权限流程去弹确认框。用户 2026-08-08 的决定是「弹窗看不懂、只会点 yes，不如别问、事后对账」，而沙箱拦的恰是最日常的联网与写临时文件两类，噪音最大。**关掉的净风险增量约等于零**：bypassPermissions 官方已明说对提示词注入零防护，沙箱在这个组合下只剩「制造弹窗」的副作用；且本工作台是隔离 devcontainer（官方推荐该模式只在此类环境用）。**注意别用环境变量**：文档提到的 CLAUDE_CODE_DISABLE_BASH_SANDBOXING / DISABLE_SANDBOX 在 v2.1.226 二进制里 grep 不到，已过时；真实键名是 sandbox.enabled（同族还有 autoAllowBashIfSandboxed / failIfUnavailable / allowUnsandboxedCommands / excludedCommands）。**想收紧回去**：把 ~/.claude/settings.json 里的 sandbox.enabled 改回 true 即可，merge 是「缺失才写」，不会把你改回来。",
+    "enabled": false
   },
   "_hooks_note": "两个 hook 用 $HOME 绝对路径（用户级 hook 的工作目录是当前项目，不能用相对路径）。都 fail-open：脚本缺失/报错一律静默放行，绝不卡住工作。在同时装了项目级同名 hook 的仓库里，用户级这份会自动静默让位（见脚本头部 preamble），不会同一件事报两遍。",
   "hooks": {
@@ -62,6 +55,17 @@
   },
   "_ask_retired_note": "**已退役的 ask 条目：存在即移除。** 为什么需要这个字段：merge_settings 对 permissions.ask 是**并集**语义（刻意的——要保护你手工加的条目），于是「从片段里删掉一条」对**已经装过的环境毫无作用**，那条会永远赖在 ~/.claude/settings.json 里继续弹窗，只有全新环境才干净。这正是本仓 2026-08-05 记过的坑「同步机制必须能表达『删除』、不能只会『叠加』」的同一形态（当时用户原话：「我删了它又出来，这跟我想的不一样」）。所以退役要**显式声明**：列进本数组的条目，merge 时若在目标里存在就删掉。注意语义边界：这里只该放**我们自己曾经发过、现在决定撤回**的条目；用户手工加的不在此列，不会被误删。",
   "_ask_retired": [
+    "Bash(git push --force:*)",
+    "Bash(git push -f:*)",
+    "Bash(git push --mirror:*)",
+    "Bash(git push --delete:*)",
+    "Bash(git clean -f:*)",
+    "Bash(git clean -d:*)",
+    "Bash(rm -rf:*)",
+    "Bash(rm -fr:*)",
+    "Bash(shred:*)",
+    "Bash(mkfs:*)",
+    "Bash(gh repo delete:*)",
     "Bash(git reset --hard:*)",
     "Bash(git branch -D:*)",
     "Bash(git stash drop:*)",
