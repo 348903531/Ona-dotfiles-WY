@@ -125,25 +125,49 @@
 - 写容器Machine层时**两个server目录都要写**:`~/.vscode-server/data/Machine/` (桌面Remote)
   与 `~/.vscode-browser-server/data/Machine/` (Ona网页版),只写一侧从另一侧连进来就没有。
   扩展安装同理(`vscode/install_extensions.sh`)——同一个坑已踩两次。
-- **`claudeCode.allowDangerouslySkipPermissions` 这类权限总开关只能用户自己在User层开**:
-  agent写它 = 自我授权，Claude Code安全分类器硬拒，别去碰。
+- **`claudeCode.allowDangerouslySkipPermissions` 这类权限总开关只能用户自己勾**:
+  agent写它 = 自我授权，Claude Code安全分类器硬拒，别去碰。**勾在哪一层见下一节——
+  它 `scope` 是 `machine`,在devcontainer里勾User层无效、必须勾 `Remote [Dev Container]`,
+  这与上面「静态偏好放User」的通则相反(2026-08-09踩到，我曾据通则误报"勾User层")。**
 
-### 不弹窗这件事：**四个**开关分属四层，缺一个就照弹(2026-08-09第二次改正)
+### 不弹窗这件事：**五个**开关分属五层，缺一个就照弹(2026-08-09第三次改正)
 
 用户诉求(原话)「BASH确认弹窗我看不懂、都会点yes，莫不如完全不要问我，你执行到结束
 再告诉我做了什么，有问题我让你回溯」;2026-08-09复述并加码「这种不断的提醒只会拖慢我
 执行任务的节奏……能不能这些弹窗都不允许弹，或者都默认是yes」。
 
-**本条已被改正两次，形态都一样：以为齐了、其实还有一层没堵。** 第一次(08-08)以为是
-一个开关、实为两个；第二次(08-09)以为是两个、实为四个。**判据别再问「开关设对没有」,
-要问「还有没有别的层也能弹」**——四层互不相干、各弹各的：
+**本条已被改正三次，形态每次都一样：以为齐了、其实还有一层没堵。** 第一次(08-08)以为是
+一个开关、实为两个；第二次(08-09)以为是两个、实为四个；第三次(08-09同日)以为四层已齐，
+**实为五层，且第二层我连"勾在哪"都写错了**。**判据别再问「开关设对没有」,
+要问「还有没有别的层也能弹」**——五层互不相干、各弹各的：
 
 | 层 | 开关 | 决定什么 | 谁来设 |
 |---|---|---|---|
 | 权限模式 | `permissions.defaultMode: "bypassPermissions"` | 新会话起步在哪个模式 | agent可准备(dotfiles的`settings-permissions.json`+`merge_settings.py`) |
-| 客户端准入 | `claudeCode.allowDangerouslySkipPermissions` | 这台电脑**允不允许出现**该模式 | VS Code **User** 标签页，**只能用户自己勾** |
+| 客户端准入 | `claudeCode.allowDangerouslySkipPermissions` | 这个窗口**允不允许出现**该模式 | 用户自己勾；**`scope: machine`——devcontainer里必须勾 `Remote [Dev Container]` 标签页，勾User层无效** |
+| **起步档位** | `claudeCode.initialPermissionMode`(扩展2.1.226新增) | **新对话直接从哪一档起步，压过上面的`defaultMode`**;设 `manual`/`default` 即永远Manual起步 | 用户自己设；同为machine scope。**留空**才会听`defaultMode` |
 | **Bash沙箱** | `sandbox.enabled: false` | **新版CLI自己默认开的第三层，`bypassPermissions`完全管不到它** | agent，同dotfiles片段 |
 | **ask名单** | `permissions.ask` **两处都要清**:用户级(走`_ask_retired`退役通道)+ **项目级仓库的`.claude/settings.json`** | 一份「这几条必须问一次」的清单 | agent；**只清一边等于没做** |
+
+**第二层的坑：`scope: machine` 与本文件「静态偏好放User」的通则相反，别照通则推**
+(2026-08-09实测)。VS Code的machine作用域设置在remote/devcontainer窗口里**只认容器侧的值**,
+落点是容器内 `~/.vscode-server/data/Machine/settings.json`(桌面Remote)与
+`~/.vscode-browser-server/data/Machine/settings.json`(Ona网页版),**两侧都要**;本地电脑
+User标签页勾了在容器窗口里读不到。**代价**:该路径在容器overlay盘，**rebuild即清空、
+每个新容器要重勾一次**(agent不能代写——权限总开关属自我授权，硬拒)。**症状长这样**:
+模式菜单里**根本没有「Bypass permissions」这一项**(不是"没选中"),而配置侧五项全绿、
+`no-prompt-guard --check` 全过、managed-settings也没禁用。
+
+**排障三条判据(这次靠它们才定位对，前两轮全靠猜)**:
+1. **判据在被测方自己的定义文件里，不在我的推测里**——`scope: machine` 是从扩展
+   `package.json` 的 `contributes.configuration` 读出来的。**读定义文件 < 5秒，
+   我却先编了一套"开关在本地User层、容器查不到属正常"的机制**,被用户一句「我勾了呀」推翻。
+   同族判据：键名去二进制`strings|grep`、行为去`package.json`/schema,别信记忆和通则。
+2. **看进程参数，不要只看配置文件**:`tr '\0' ' ' < /proc/$CLAUDE_PID/cmdline`。带
+   `--resume=` 的是**恢复出来的老会话、模式从旧记录照抄**——拿它证明"配置还在生效"是假绿。
+   本轮"以前明明能用"的那几个会话全是resume出来的。
+3. **取会话真实启动时间用transcript首行timestamp,别用文件mtime**——老会话继续对话也刷新
+   mtime,会伪造出"同一分钟两个会话两种模式"的假象，我据此推出过一整条作废的结论。
 
 **沙箱这层的坑最深，因为它长得跟权限弹窗一模一样**：同样是 "Allow this bash command?",
 但它按**操作系统边界**放行——**读全盘OK、写只限当前工作目录+session temp、网络只限
@@ -159,9 +183,14 @@
 
 **可迁移的元教训(比本条具体内容更值钱)**:用户报「我设置过了、为什么还是X」时，**别只
 去验他说的那个开关**——验完全绿就回「配置是对的」是最没用的回答。要**穷举"还有什么
-东西也能造成X"**,再逐个排除。本轮四层里，前两层验了全绿、真凶在后两层；只验前两层
+东西也能造成X"**,再逐个排除。第二轮的四层里，前两层验了全绿、真凶在后两层；只验前两层
 就会得出"一切正常"的假结论，而用户明明还在被弹。同源于本文件「说『只有N种』之前先反查
 一次『还有没有别的』」,只是那条讲论断、这条讲排障。
+**第三轮又证一次(2026-08-09同日)**:这次**五层配置侧全绿、守卫脚本`--check`四项全过、
+企业策略也没禁用**,用户照样进不了Bypass——**"我查的那几层全绿"永远不等于"没有别的层"**。
+更狠的是，**层数写全了也可能每一层的内容是错的**:第二层我把落点写成"User标签页",
+实际是machine scope要勾Remote侧，于是用户照着做了、失败了、还得再问我一轮。
+**穷举层数之外，每一层的落点也要有一手依据(定义文件/二进制),不能靠通则外推。**
 
 **改正一条曾经记错的结论**:此前本文件与WY仓AGENTS.md卡#27写着「Bypass须**每次启动时**
 启用」,据此认为做不成持久默认、只能每次手点。**错了**——官方`permission-modes`文档明文
@@ -172,7 +201,7 @@ without it"说的只是不能在会话**中途**切进去，不是"每次都要�
 是把runtime限制误当成config限制——遇到"只能启动时生效"的说法，先去查有没有对应的
 持久化配置键。**
 
-**四层全关后仍会弹的，只剩这几类，刻意保留**:① **质量闸门hook**(WY仓14个
+**五层全关后仍会弹的，只剩这几类，刻意保留**:① **质量闸门hook**(WY仓14个
 `*-delivery-gate`/`*-guard`,只在**交付PPT/Word那一刻**查数据绑没绑原文、引文格式、
 文件能不能打开——日常写代码跑分析完全不响);② `destructive-command-guard`(只在要删/
 覆盖关键文件、**且agent在对话正文里没交代过**时ask,交代过自动放行);③ `rm -rf /` 与
