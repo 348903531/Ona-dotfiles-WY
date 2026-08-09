@@ -103,15 +103,40 @@
 - **`claudeCode.allowDangerouslySkipPermissions` 这类权限总开关只能用户自己在User层开**:
   agent写它 = 自我授权，Claude Code安全分类器硬拒，别去碰。
 
-### 不弹窗这件事：两个开关是一对，别只记住用户那一半(2026-08-08改正)
+### 不弹窗这件事：**四个**开关分属四层，缺一个就照弹(2026-08-09第二次改正)
 
 用户诉求(原话)「BASH确认弹窗我看不懂、都会点yes，莫不如完全不要问我，你执行到结束
-再告诉我做了什么，有问题我让你回溯」。落地是**两个开关，缺一不可**,分属两层：
+再告诉我做了什么，有问题我让你回溯」;2026-08-09复述并加码「这种不断的提醒只会拖慢我
+执行任务的节奏……能不能这些弹窗都不允许弹，或者都默认是yes」。
 
-| 开关 | 落点 | 决定什么 | 谁来设 |
+**本条已被改正两次，形态都一样：以为齐了、其实还有一层没堵。** 第一次(08-08)以为是
+一个开关、实为两个；第二次(08-09)以为是两个、实为四个。**判据别再问「开关设对没有」,
+要问「还有没有别的层也能弹」**——四层互不相干、各弹各的：
+
+| 层 | 开关 | 决定什么 | 谁来设 |
 |---|---|---|---|
-| `permissions.defaultMode: "bypassPermissions"` | `~/.claude/settings.json`(dotfiles的`settings-permissions.json`+`merge_settings.py`注入) | **新会话起步在哪个模式** | agent可准备，**用户执行落地** |
-| `claudeCode.allowDangerouslySkipPermissions` | VS Code **User** 标签页(本地电脑) | 这台电脑**允不允许出现**该模式 | **只能用户自己勾** |
+| 权限模式 | `permissions.defaultMode: "bypassPermissions"` | 新会话起步在哪个模式 | agent可准备(dotfiles的`settings-permissions.json`+`merge_settings.py`) |
+| 客户端准入 | `claudeCode.allowDangerouslySkipPermissions` | 这台电脑**允不允许出现**该模式 | VS Code **User** 标签页，**只能用户自己勾** |
+| **Bash沙箱** | `sandbox.enabled: false` | **新版CLI自己默认开的第三层，`bypassPermissions`完全管不到它** | agent，同dotfiles片段 |
+| **ask名单** | `permissions.ask` **两处都要清**:用户级(走`_ask_retired`退役通道)+ **项目级仓库的`.claude/settings.json`** | 一份「这几条必须问一次」的清单 | agent；**只清一边等于没做** |
+
+**沙箱这层的坑最深，因为它长得跟权限弹窗一模一样**：同样是 "Allow this bash command?",
+但它按**操作系统边界**放行——**读全盘OK、写只限当前工作目录+session temp、网络只限
+白名单**,越界的命令回落到权限流程弹确认框。于是 `git fetch`、`… > /tmp/x` 这类最日常的
+操作逐条弹，而defaultMode、ask、hook全查一遍都是好的、doctor全绿、transcript里
+`permissionMode` 确实是 `bypassPermissions`——**四处证据都说"配置没问题",弹窗照旧**。
+**定位靠对照实验、不靠读配置**:写cwd内→不弹 / 写`/tmp`→弹 / 联网→弹 / 读全盘→不弹，
+边界一比就出来了。**别用环境变量**:文档里的 `CLAUDE_CODE_DISABLE_BASH_SANDBOXING`、
+`DISABLE_SANDBOX` 在v2.1.226二进制里 `strings|grep` 根本不存在、已过时；真键名是
+`sandbox.enabled`(同族 `autoAllowBashIfSandboxed`/`failIfUnavailable`/
+`allowUnsandboxedCommands`/`excludedCommands`)。**拿二进制里grep得到的键名当判据，
+比文档可靠**——文档页会被截断、会滞后，二进制是这台机器上真正在跑的那份。
+
+**可迁移的元教训(比本条具体内容更值钱)**:用户报「我设置过了、为什么还是X」时，**别只
+去验他说的那个开关**——验完全绿就回「配置是对的」是最没用的回答。要**穷举"还有什么
+东西也能造成X"**,再逐个排除。本轮四层里，前两层验了全绿、真凶在后两层；只验前两层
+就会得出"一切正常"的假结论，而用户明明还在被弹。同源于本文件「说『只有N种』之前先反查
+一次『还有没有别的』」,只是那条讲论断、这条讲排障。
 
 **改正一条曾经记错的结论**:此前本文件与WY仓AGENTS.md卡#27写着「Bypass须**每次启动时**
 启用」,据此认为做不成持久默认、只能每次手点。**错了**——官方`permission-modes`文档明文
@@ -122,11 +147,22 @@ without it"说的只是不能在会话**中途**切进去，不是"每次都要�
 是把runtime限制误当成config限制——遇到"只能启动时生效"的说法，先去查有没有对应的
 持久化配置键。**
 
-**仍会弹的三类，刻意保留**:① `permissions.ask` 那20条不可逆操作(官方保证explicit ask
-rules在bypass模式下仍强制弹窗);② `rm -rf /` 与 `rm -rf ~` 内置熔断；③ 组织策略禁用该
-模式时自动退回。**代价要让用户知情**:bypass对提示词注入零防护，官方要求只在隔离容器/VM/
-devcontainer里用。**配套义务**:放弃逐次事前确认，就**必须**有一次性事后对账——由
-`session-change-digest` Stop hook自动打印本轮全部改动(agent忘了写也照样出现)。
+**四层全关后仍会弹的，只剩这几类，刻意保留**:① **质量闸门hook**(WY仓14个
+`*-delivery-gate`/`*-guard`,只在**交付PPT/Word那一刻**查数据绑没绑原文、引文格式、
+文件能不能打开——日常写代码跑分析完全不响);② `destructive-command-guard`(只在要删/
+覆盖关键文件、**且agent在对话正文里没交代过**时ask,交代过自动放行);③ `rm -rf /` 与
+`rm -rf ~` 内置熔断；④ 组织策略禁用bypass时自动退回。**为什么不一并关掉①②**:它们拦的
+分别是「数字没核就外发」和「文件删了找不回」,正是用户自己反复立的红线，且频率极低
+(几周一次),与用户烦的「每条命令都问」不是一回事——但**要在汇报里主动说清它们存在、
+何时会响**,让用户自己决定要不要也关，别替他默认保留又不告诉他。
+
+**代价要让用户知情**:bypass对提示词注入零防护、关沙箱又去掉一层文件系统隔离，官方要求
+只在隔离容器/VM/devcontainer里用。**配套义务**:放弃逐次事前确认，就**必须**有一次性
+事后对账——由`session-change-digest` Stop hook自动打印本轮全部改动(agent忘了写也照样出现)。
+
+**设置类改动别默认「要重开会话才生效」**:本轮`sandbox.enabled`与ask清零**当场就生效**了
+(同一条写`/tmp`的命令，改前弹、改后不弹)。差点白让用户等一轮——**改完立刻用「刚才弹过的
+那条同类命令」原地验一次**,比嘴上说"重开会话试试"强。
 
 **交付时必须说清作用域**:每次汇报改动，写明这条是「跨项目通用」还是「只对本项目」。
 用户看不到落点，只能靠你说。
