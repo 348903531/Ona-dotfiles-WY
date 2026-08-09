@@ -120,12 +120,23 @@ PY
   else
     # 期望条数**从片段现读**，不写死——写死的话每次增删 ask 名单都要记得同步改这里，
     # 漏改的那次正好是「名单被清空、体检却仍报绿」。同型教训见下方 hook 名那段。
+    # 2026-08-09 修正判据方向：用户要求 ask 清零后，这里原来的「应 ≥11 条，少了就 FAIL」
+    # 当场把**正确的新状态**报成了 FAIL。根因是那句兜底 `[ "$_n_want" -gt 0 ] || _n_want=11`
+    # **把「读到 0」和「读不到」混为一谈**——片段真的是 0 条时，它当成读取失败、退回硬编码 11。
+    # 教训同型：判据要跟着 SSOT 走，而「读不到就退回旧硬编码」这种兜底会在 SSOT 合法地
+    # 变成 0/空 时反噬。现在只把**非数字**当读取失败，读到 0 就是 0。
     _n_want="$(python3 -c "import json,io,sys;d=json.load(io.open(sys.argv[1],encoding='utf-8'));print(len((d.get('permissions') or {}).get('ask') or []))" \
                "$DOT/claude/settings-permissions.json" 2>/dev/null)"
-    [ -n "$_n_want" ] && [ "$_n_want" -gt 0 ] 2>/dev/null || _n_want=11
-    [ "${n_ask:-0}" -ge "$_n_want" ] && ok "permissions.ask $n_ask 条（做完真回不去的操作仍会弹窗）" \
-      || bad "permissions.ask 只有 $n_ask 条（应 ≥$_n_want）——安全网被清空了" \
-             "python3 ~/dotfiles/claude/merge_settings.py"
+    case "$_n_want" in ''|*[!0-9]*) _n_want=0 ;; esac
+    if [ "$_n_want" -eq 0 ]; then
+      [ "${n_ask:-0}" -eq 0 ] && ok "permissions.ask 已清零（用户 2026-08-09 要求：一条都别弹）" \
+        || warn "permissions.ask 还剩 $n_ask 条残留，这几条仍会弹窗" \
+                "python3 ~/.claude/hooks/no-prompt-guard.py   # 直接跑一次即清掉"
+    else
+      [ "${n_ask:-0}" -ge "$_n_want" ] && ok "permissions.ask $n_ask 条（做完真回不去的操作仍会弹窗）" \
+        || bad "permissions.ask 只有 $n_ask 条（应 ≥$_n_want）——安全网被清空了" \
+               "python3 ~/dotfiles/claude/merge_settings.py"
+    fi
     [ "${n_hook:-0}" -ge 2 ] && ok "用户级 hook $n_hook 个（危险命令中文弹窗 + 收尾改动清单）" \
       || bad "用户级 hook 只有 $n_hook 个（应 ≥2）" "python3 ~/dotfiles/claude/merge_settings.py"
     [ "${has_env:-0}" = "1" ] && ok "内网代理 env 完好（合并没伤到它）" \
@@ -138,7 +149,7 @@ PY
       -)  warn "permissions.defaultMode 没设——新会话会从 Manual 起步、每条命令都弹窗" \
                "python3 ~/dotfiles/claude/merge_settings.py" ;;
       bypassPermissions)
-          ok "defaultMode=bypassPermissions（技术执行类不再弹窗；ask 那 ${n_ask} 条仍会问）" ;;
+          ok "defaultMode=bypassPermissions（技术执行类不再弹窗；ask 剩 ${n_ask} 条，详见 3b 节）" ;;
       *)  ok "defaultMode=$dmode（你自己设的，体检不改它）" ;;
     esac
   fi
@@ -170,6 +181,28 @@ for h in $_hook_names; do
   if [ -e "$p" ]; then ok "hook 脚本在：$h.py"
   else bad "hook 脚本缺失/断链：$h.py" "bash ~/dotfiles/install.sh"; fi
 done
+
+# ── 3b. 免弹窗四层：不是「设过没有」，是「现在还全不全」────────────────────
+#
+# 为什么单列一节而不是并进第 3 节：第 3 节查的是 defaultMode 这**一层**，而 2026-08-09
+# 实测发现免弹窗其实是**四层**，前两层全绿、真凶在后两层（Bash 沙箱 + ask 名单）。
+# 当时 doctor 报的正是「全绿」，用户却还在被弹——**体检查了它认识的层，就宣布一切正常**,
+# 这本身就是一种假绿。所以这一节改成调 no-prompt-guard.py --check，让「守配置」的那个
+# 脚本自己来报，体检和 hook 共用同一份判据、不会各说各话（判据只有一份，不会漂移）。
+head_ "3b) 免弹窗四层（沙箱 / ask 名单 / 项目级）"
+_npg="$HOME/.claude/hooks/no-prompt-guard.py"
+if [ ! -e "$_npg" ]; then
+  bad "no-prompt-guard.py 缺失/断链——没有任何东西在守免弹窗配置了" "bash ~/dotfiles/install.sh"
+else
+  _npg_out="$(python3 "$_npg" --check 2>&1)"; _npg_rc=$?
+  printf '%s\n' "$_npg_out" | sed 's/^/  /'
+  if [ "$_npg_rc" -eq 0 ]; then
+    ok "四层齐全（开机 hook 会把前三项自动修回去，不用你记）"
+  else
+    bad "有层没到位——上面标 ❌ 的那几条会让命令继续弹窗" \
+        "python3 ~/.claude/hooks/no-prompt-guard.py   # 直接跑一次即自动修复（项目级需手改）"
+  fi
+fi
 
 # ── 4. 止血补丁：镜像脚本别再清空上面那一层 ───────────────────────────────
 head_ "4) welcome-claude.sh 覆盖补丁"

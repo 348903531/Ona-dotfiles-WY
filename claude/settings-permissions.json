@@ -15,6 +15,19 @@
   },
   "_hooks_note": "两个 hook 用 $HOME 绝对路径（用户级 hook 的工作目录是当前项目，不能用相对路径）。都 fail-open：脚本缺失/报错一律静默放行，绝不卡住工作。在同时装了项目级同名 hook 的仓库里，用户级这份会自动静默让位（见脚本头部 preamble），不会同一件事报两遍。",
   "hooks": {
+    "SessionStart": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "GUARD=\"$HOME/.claude/hooks/no-prompt-guard.py\"; [ -f \"$GUARD\" ] && python3 \"$GUARD\" || exit 0"
+          }
+        ],
+        "description": "No-prompt guard (user-level): 开机把「免弹窗」三项配置**自动修回去**，不是提醒。用户 2026-08-09 原话「为什么反复改了好多遍还是不能改成硬性的规定……不要只是提醒」——这条批评击中的是本仓最典型的失败形态：**每次都在「改配置」，从来没有东西在「守配置」**。三轮下来每轮都是「用户又被弹 → 人肉排查 → 改配置 → 宣布搞定」，而配置是一次性的，没人在开机时核一遍它还在不在（08-07 就被 welcome-claude.sh 整文件覆盖过）。守三项：permissions.defaultMode / sandbox.enabled / permissions.ask，都在 ~/.claude/settings.json、不进 git，逐键改写绝不整体重写（env 里的内网代理一个字节不动，有回归测试盯）。项目级 ask 只报告不自动改（那文件在 git 里，自动改会让工作区平白变脏）。CLI 版本变了会提示「可能有新的弹窗层」——沙箱当初就是这么冒出来的、读配置读不出来，只能靠对照实验。后门：settings.json 里写 \"_no_prompt_guard\": \"off\" 即完全让位。fail-open，绝不卡启动。自测 16/16（含坏状态退出码真非 0、env 保全、损坏文件不覆盖）。",
+        "id": "sessionstart:no-prompt-guard"
+      }
+    ],
     "PreToolUse": [
       {
         "matcher": "Bash",
