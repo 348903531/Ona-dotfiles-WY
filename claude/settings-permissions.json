@@ -28,19 +28,7 @@
         "id": "sessionstart:no-prompt-guard"
       }
     ],
-    "PreToolUse": [
-      {
-        "matcher": "Bash",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "GUARD=\"$HOME/.claude/hooks/destructive-command-guard.py\"; [ -f \"$GUARD\" ] && python3 \"$GUARD\" || exit 0"
-          }
-        ],
-        "description": "Destructive-command guard (user-level): 只对**做完回不去**的命令 ask，且弹窗正文是中文人话，写清「这条命令做什么、丢什么、还能不能找回」——治的正是「弹窗看不懂、每次只会点 yes」。刻意不拦可重来的（rm -f 单文件 / mv / cp / commit --amend / rebase / reset --soft / clean -n / stash pop / branch -d），否则又退回噪音。判据基于 shlex 命令位置解析，不做文本匹配（早期正则版连续三轮误报：heredoc 正文 → echo 参数 → 循环里的字符串字面量）。",
-        "id": "pre:bash:destructive-command-guard"
-      }
-    ],
+    "PreToolUse": [],
     "Stop": [
       {
         "matcher": "*",
