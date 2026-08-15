@@ -21,7 +21,7 @@ set -uo pipefail
 SRC_REPO="${WY_REPO:-/workspaces/WY-workspace-P}"
 SRC_DIR="$SRC_REPO/.claude/hooks"
 DST_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/hooks"
-HOOKS=(destructive-command-guard.py session-change-digest.py)
+HOOKS=(destructive-command-guard.py session-change-digest.py regen-overwrite-guard.py)
 CHECK_ONLY=0
 [ "${1:-}" = "--check" ] && CHECK_ONLY=1
 
@@ -33,7 +33,7 @@ fi
 
 gen() {   # gen <源文件> → stdout（源 + preamble）
   python3 - "$1" <<'PY'
-import io, sys, os
+import io, re, sys, os
 src = io.open(sys.argv[1], encoding="utf-8").read()
 name = os.path.basename(sys.argv[1])
 preamble = '''
@@ -58,8 +58,14 @@ if _proj and _os.path.isfile(
         _os.path.join(_proj, ".claude", "hooks", _os.path.basename(__file__))):
     _sys.exit(0)          # 项目级已装同名 hook → 让它来，避免同一件事报两遍
 ''' % name
+# 插入点：docstring 之后；但若源文件有 `from __future__ import ...`，
+# 必须插在它**之后**——__future__ 导入必须紧跟 docstring，插前面会 SyntaxError。
+# （2026-08-14 踩到：regen-overwrite-guard.py 带 __future__，生成的副本语法不过。）
 marker = '\n"""\n'
 i = src.index(marker, src.index('"""')) + len(marker)
+fut = re.search(r'^from __future__ import [^\n]*\n', src[i:], re.M)
+if fut and fut.start() < 200:          # 只认紧跟 docstring 的那一条
+    i += fut.end()
 sys.stdout.write(src[:i] + preamble + src[i:])
 PY
 }
@@ -75,9 +81,16 @@ for h in "${HOOKS[@]}"; do
     echo "  [sync-hooks] ⚠️  $h 与源仓库**已漂移** —— 跑 sync-hooks.sh 同步"
     drift=1
   else
+    # 先验语法再写盘：旧版是「先 mv 覆盖、再 py_compile」，语法不过时坏文件
+    # 已经落到 ~/.claude/hooks/ 了，而末行还照打 ✅——等于用一个坏副本替换好副本。
+    # 2026-08-14 实测踩到，改为「验过才覆盖」。
+    if ! python3 -m py_compile "$tmp" 2>/dev/null; then
+      echo "  [sync-hooks] ❌ $h 生成后语法不过，**不覆盖**已有副本；请修 gen() 的插入点"
+      python3 -m py_compile "$tmp" 2>&1 | tail -3
+      rm -f "$tmp"; drift=1; continue
+    fi
     mkdir -p "$DST_DIR"
     mv "$tmp" "$DST_DIR/$h"
-    python3 -m py_compile "$DST_DIR/$h" || { echo "  [sync-hooks] ❌ $h 同步后语法不过"; drift=1; }
     echo "  [sync-hooks] ✅ 已同步 $h"
   fi
   rm -f "$tmp"

@@ -28,7 +28,18 @@
         "id": "sessionstart:no-prompt-guard"
       }
     ],
-    "PreToolUse": [],
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "id": "regen-overwrite-guard",
+            "type": "command",
+            "command": "GUARD=\"$HOME/.claude/hooks/regen-overwrite-guard.py\"; [ -f \"$GUARD\" ] && python3 \"$GUARD\" || exit 0"
+          }
+        ]
+      }
+    ],
     "Stop": [
       {
         "matcher": "*",
