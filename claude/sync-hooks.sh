@@ -21,7 +21,7 @@ set -uo pipefail
 SRC_REPO="${WY_REPO:-/workspaces/WY-workspace-P}"
 SRC_DIR="$SRC_REPO/.claude/hooks"
 DST_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/hooks"
-HOOKS=(destructive-command-guard.py session-change-digest.py regen-overwrite-guard.py)
+HOOKS=(destructive-command-guard.py session-change-digest.py regen-overwrite-guard.py unverified-claim-guard.py)
 CHECK_ONLY=0
 [ "${1:-}" = "--check" ] && CHECK_ONLY=1
 

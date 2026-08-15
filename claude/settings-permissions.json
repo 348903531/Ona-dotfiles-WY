@@ -62,6 +62,15 @@
         ],
         "description": "Unanswered-question guard (user-level): 会话收尾从 transcript 抽出用户**这一条消息里提的每个问题**（含无问号的疑问句、祈使形式的请求、上一轮重复问的标 🔁），原样列给 agent 自查。用户 2026-08-08 点名「你回答问题的时候总是漏问题」——当轮实例：问「ADHD 模式默认打开了吗」，我做了却只在表格里塞半句、没正面答。与 todo-silent-drop-guard 同源且更根本：那条防「验收清单被我改窄」，这条防「要答哪几条被我按自己关注点筛过」，都是拿自己动过的东西证明自己做完了。刻意**只抽取、不判断答没答**（语义判断必误报，误报几次提醒就失信）。阈值 ≥2 个问题才响（单问题漏答概率低，报了是噪音）。刻意不设 systemMessage——清单给 agent 自查，不弹给用户刷屏。URL 先挖掉再切句（真实误报：Drive 链接里的 ? 曾让一条消息虚报 6 个问题，是拿 6 个真实会话当基线才照出来的）。fail-open、不 block。",
         "id": "stop:unanswered-question-guard"
+      },
+      {
+        "hooks": [
+          {
+            "id": "unverified-claim-guard",
+            "type": "command",
+            "command": "GUARD=\"$HOME/.claude/hooks/unverified-claim-guard.py\"; [ -f \"$GUARD\" ] && python3 \"$GUARD\" || exit 0"
+          }
+        ]
       }
     ]
   },
