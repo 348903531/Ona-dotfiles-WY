@@ -109,6 +109,32 @@ GREEN_RE = re.compile(
     r"\bPASSED\b|\bPASS\b|✅|EXIT=0|退出码\s*0|0 FAILED|0 FAIL\b|全部通过",
 )
 
+# ── D：如实说明「这一项确实失败了、且为什么」──────────────────────────
+#
+# 为什么要有这条（2026-08-15 补，本 hook 上线次日就撞上）：
+# 原判据只给两条出路——「重跑转绿」或「把话改成实际状态」，但**只有前者可机械识别**。
+# 于是当失败来自**外部客观限制**（对方设了禁止下载 / 接口下线 / 凭据在别人手里 /
+# 403、404），「重跑转绿」这条路**永远走不通**：那不是我能修的东西。
+# 实测形态：一次批量下载 135 个文件，134 个 OK、1 个 403（文件被所有者设了
+# canDownload:false）。我当场诊断、试了两条替代路径、并在报告 / PR 正文 / memory
+# 三处都写明「这份拿不到，只取到封面」——**完全按第二条出路处置了**，但因为它
+# 不可能转绿，本 hook 每一轮都重报一次同一处，连报三轮。
+#
+# 这种「正确处置了却永远报」的误报最危险：它逼人去按 UNVERIFIED_CLAIM_GUARD_SKIP=1
+# 静音，而静音之后**真的假绿也一并看不见了**——比不报更糟。
+# 所以补第三条出路：**在失败与成功断言之间，正文如实说明了该项失败及原因** → 放过。
+#
+# 注意它放过的不是「假绿」：假绿的定义是「没看输出就宣称通过」。这里 agent 已经
+# 把失败摆到台面上了，用户看得见，判断权回到人手里——这正是本闸门想要的结果。
+ACK_RE = re.compile(
+    r"(?:拿不到|取不到|下不了|读不到|获取不到|无法(?:获取|下载|读取|访问|完成))"
+    r"|(?:被(?:限制|拒绝|禁止))|禁止下载|canDownload"
+    r"|(?:该|这|那)(?:一)?(?:项|条|份|个)?(?:确实|的确)?失败"
+    r"|(?:未|没)(?:能|有)?成功|失败了|报了\s*40[0-9]|\b40[34]\b"
+    r"|SKIP(?:ped)?\b|跳过(?:了)?|只(?:取|拿|下)到"
+    r"|(?:客观|外部)(?:限制|原因)|不是我能修",
+)
+
 
 def _iter(path):
     with open(path, encoding="utf-8") as fh:
@@ -122,10 +148,38 @@ def _iter(path):
                 continue
 
 
-def _events(path):
+def _events(path, current_turn_only=True):
+    """把 transcript 摊平成时间序事件。
+
+    current_turn_only=True 时**只看最后一条用户消息之后**的事件——这是本 hook
+    从「每轮刷屏」变成「可用」的关键：
+
+    Stop hook 每一轮都跑，而 transcript 是只增不减的。若扫全量，会话早期的一次
+    命中会在**此后每一轮永远重报**，哪怕当轮早已如实交代或修好——用户没有任何
+    办法让它闭嘴，最终只会把闸门关掉。2026-08-14 实测：同 4 处连报两轮，
+    第二轮是在我已逐条如实说明之后。
+
+    只看当轮的代价：跨轮的「上一轮失败、这一轮才宣称通过」抓不到。
+    这是刻意取舍——**误报每轮刷屏的代价，远大于漏掉跨轮那一档**。
+    """
     """把 transcript 摊平成时间序的 (kind, cmd, text) 列表。"""
     out = []
-    for d in _iter(path):
+    records = list(_iter(path))
+    if current_turn_only:
+        # 从后往前找最后一条**用户自然语言**消息（tool_result 也挂在 user 角色下，
+        # 不能只看 role=user，必须是 type=text 的那种）
+        start = 0
+        for idx in range(len(records) - 1, -1, -1):
+            msg = records[idx].get("message")
+            if not isinstance(msg, dict) or msg.get("role") != "user":
+                continue
+            c = msg.get("content")
+            if isinstance(c, str) or (isinstance(c, list) and any(
+                    isinstance(b, dict) and b.get("type") == "text" for b in c)):
+                start = idx
+                break
+        records = records[start:]
+    for d in records:
         msg = d.get("message")
         if not isinstance(msg, dict):
             continue
@@ -177,6 +231,9 @@ def analyze(events):
                         break
                 if failed_cmd == "__RERAN_OK__":
                     break
+            if kind2 == "say" and ACK_RE.search(text2) and not CLAIM_RE.search(text2):
+                # D：正文如实说明了这一项失败（且这段话里没顺带宣称通过）→ 已合规处置
+                break
             if kind2 == "say" and CLAIM_RE.search(text2):
                 m = CLAIM_RE.search(text2)
                 hits.append((
@@ -203,7 +260,12 @@ HEAD = (
     "  · commit message 写「已装并验证通过」，而文件那一刻根本不存在。\n\n"
     "逐条回看下面这几处：要么补跑一次并贴真实输出，要么把话改成实际状态。\n"
 )
-TAIL = "\n（红测试故意制造失败属正常——只要之后重跑转绿，本 hook 会自动放过。误判：UNVERIFIED_CLAIM_GUARD_SKIP=1）"
+TAIL = (
+    "\n（两条出路都会被自动放过：① 重跑那条命令并转绿（红测试的常规形态）；"
+    "② **在正文如实说明这一项失败及原因**——用于外部客观限制致败、根本不可能"
+    "转绿的情形（对方禁止下载 / 接口下线 / 403）。但「既承认失败又宣称通过」仍会报。"
+    "\n误判逃生阀：UNVERIFIED_CLAIM_GUARD_SKIP=1）"
+)
 
 
 def main():
