@@ -186,8 +186,16 @@ auto档**什么都写不了、什么命令都跑不了**,报
 auto档另有一套自己的配置 `autoMode.{environment, allow, soft_deny, hard_deny, deny}`
 (字符串数组，落 `~/.claude/settings.json` 或项目 `.claude/settings.local.json`),
 交互式生成走 `/auto-mode-setup`,重置走 `claude auto-mode reset`。
-**⚠️ 未验证**:"命中 `autoMode.allow` 是否就完全不问那个远端模型"——这是推断，没有一手证据，
-别拿它当分类器故障时的救生索。**用户2026-08-27已定：不设自动起步档，每次在扩展面板手选
+**⚠️ 已验证，且社区流传的说法是错的**(2026-08-27,判据取自CLI二进制自己的schema描述):
+`autoMode.allow` 的官方描述逐字是 "**Rules for the auto mode classifier allow section**
+(include the literal string `$defaults` to inherit the built-in rules at that position)"——
+它是**喂进分类器system prompt的规则文本**,不是绕开分类器的旁路;分类器模型不可用时，
+写多少条allow规则都没用。**社区那句「加 `autoMode.allow` 让脚本直接绕过分类器」是错的。**
+另一条路也堵死：`permissions.allow` 里那些真能绕过分类器的条目，CLI里明写
+"permissions.allow entries auto mode **ignores** (classifier-bypassing, in your user settings)"
+——auto档直接无视它们(与本仓早先"往 `permissions.allow` 加白名单对auto模式几乎无效"的观察吻合)。
+**结论：分类器一挂，没有任何allow规则救得了，唯一的出路是换档。** 这也再次印证
+「判据在被测方自己的定义文件里」——群里传的解法听着合理，读一眼schema就知道方向反了。**用户2026-08-27已定：不设自动起步档，每次在扩展面板手选
 Bypass**(理由是 `claudeCode.initialPermissionMode` 落在容器overlay盘、rebuild即清空,
 "与其重建后从零开始，不如现在就养成手选的习惯")。
 
