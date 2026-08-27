@@ -169,6 +169,60 @@ def vscode_toggle_missing():
     return missing
 
 
+# ── 第一层：CLI 参数（2026-08-27 新增，优先级压过下面所有配置文件） ──────────────
+# VS Code 扩展启动 CLI 时**每次都显式传** `--permission-mode <档>`，而命令行参数
+# 压过 ~/.claude/settings.json 里的 defaultMode —— 也就是说本 hook 守了三轮的那个键，
+# 在 VS Code 场景里**根本不被读**。
+#
+# 这比「闸门失效」更隐蔽：本 hook 每次开机都尽责地把 defaultMode 写回 bypassPermissions、
+# --check 四项全过、doctor 全绿，而真实档位是扩展面板上选的那个。
+# **闸门在认真地守一个不管用的键，而且每次都报绿**，所以三轮排障都没怀疑到它。
+#
+# 判据只能来自进程自己（实测 /proc/<pid>/cmdline 逐字读出）：
+#   …/claude --output-format stream-json … --permission-mode auto --allow-dangerously-skip-permissions
+# 同一容器里不同会话可以是不同档，这本身就证明档位是逐会话选的、不是配置定的。
+#
+# 特别关注 `auto` 档。CLI 二进制里的官方定义逐字是：
+#   'auto' - Use a model classifier to approve/deny permission prompts.
+# 它靠一个**远端模型**判「这条命令危不危险」，于是那个模型不可用时，auto 档
+# 什么都写不了、什么命令都跑不了（只读操作照常），报
+#   "<model> is temporarily unavailable, so auto mode cannot determine the safety of Write"
+# 2026-08-26~27 社区大面积撞上。bypassPermissions 是纯本地判定、零外部依赖，不受影响。
+MODE_FLAG = "--permission-mode"
+WANT_MODE = "bypassPermissions"
+
+
+def actual_permission_mode(max_hops=8):
+    """本会话**真正在跑**的权限档；读不到返回 None（fail-open，绝不猜）。
+
+    从自己往上爬进程树，找第一个命令行里带 --permission-mode 的进程。
+    返回 None 有两种情形，都不该报警：① 纯终端 `claude` 启动（没传这个参数，
+    那时 defaultMode 才真的说了算）；② /proc 读不到（非 Linux / 权限不足）。
+    """
+    pid = os.getpid()
+    for _ in range(max_hops):
+        try:
+            with open("/proc/%d/cmdline" % pid, "rb") as f:
+                argv = [a.decode("utf-8", "replace") for a in f.read().split(b"\0") if a]
+        except Exception:
+            return None
+        for i, a in enumerate(argv):
+            if a == MODE_FLAG and i + 1 < len(argv):
+                return argv[i + 1]
+            if a.startswith(MODE_FLAG + "="):
+                return a.split("=", 1)[1]
+        try:
+            # /proc/<pid>/stat 的 comm 字段可能含空格和括号，必须从最后一个 ")" 之后切
+            with open("/proc/%d/stat" % pid, "r") as f:
+                raw = f.read()
+            pid = int(raw[raw.rindex(")") + 1:].split()[1])
+        except Exception:
+            return None
+        if pid <= 1:
+            return None
+    return None
+
+
 def project_ask(project_dir):
     """项目级 ask 名单（非空即为会弹窗的来源）。拿不到就返回 []。"""
     if not project_dir:
@@ -222,8 +276,24 @@ def _remember(version):
         pass
 
 
-def build_report(fixed, proj_ask, bumped, old_v, new_v, vsc_missing=()):
+def build_report(fixed, proj_ask, bumped, old_v, new_v, vsc_missing=(), mode=None):
     lines = []
+    if mode is not None and mode != WANT_MODE:
+        lines.append(
+            "【免弹窗自检】本会话**真实档位是 `%s`**（从 /proc 的 `--permission-mode` 读到的），"
+            "不是 settings.json 里那个 `defaultMode`。命令行参数压过配置文件，"
+            "所以本 hook 修的 `defaultMode` 在 VS Code 场景下不起作用——档位由扩展面板上"
+            "选的那一档决定。别再拿「配置全绿」当档位没问题的证据。" % mode
+        )
+        if mode == "auto":
+            lines.append(
+                "  ⚠️ `auto` 这一档靠**远端模型**逐条判「这条命令危不危险」"
+                "（官方定义：Use a model classifier to approve/deny permission prompts）。"
+                "那个模型一不可用，写文件和跑命令**全部被拒**、只剩只读能用，"
+                "报 “… is temporarily unavailable, so auto mode cannot determine the safety of …”。"
+                "撞上了别排查本机——本机没问题，让用户在扩展面板上把档位换成 "
+                "Bypass permissions 即可（那一档纯本地判定、不问任何远端模型）。"
+            )
     if vsc_missing:
         lines.append(
             "【免弹窗自检】VS Code 侧的**准入开关**没了，所以模式菜单里根本不会出现 "
@@ -270,6 +340,28 @@ def build_report(fixed, proj_ask, bumped, old_v, new_v, vsc_missing=()):
             "哪条弹哪条不弹，边界立刻现形。" % (old_v, new_v)
         )
     return "\n".join(lines)
+
+
+def build_auto_mode_user_message(mode):
+    """**只对 `auto` 档报**，给用户自己看的那条。
+
+    为什么只对 auto、不对 plan/acceptEdits/default 报（2026-08-27 定的判据）：
+    那几档是用户**主动选的工作方式**，报它纯属噪音、提醒会迅速失信；auto 不一样——
+    它有一个别的档都没有的失败模式：**远端判定模型一挂，整个会话什么都干不了**，
+    而用户看到的只是一句英文报错，通常会以为是自己环境坏了、跑去重启容器。
+    这一条正是「他自己点一下就能免疫、但不告诉他就永远不知道」的那类，所以值得占用一次提醒。
+    """
+    if mode != "auto":
+        return None
+    return (
+        "ℹ️  这个会话现在跑在 **Auto 档**（面板右下角可切）。Auto 的判定是"
+        "「每次写文件/跑命令，先问一个远端模型这条危不危险」——那个模型一抖，"
+        "我这边就会连着报 “temporarily unavailable / cannot determine the safety”，"
+        "写不了文件也跑不了命令（只读还能用）。这不是你的环境坏了。\n"
+        "想彻底免疫：把档位切成 **Bypass permissions**，那一档纯本地判定、不问任何远端模型。\n"
+        "（你 2026-08-27 定的是每次手选、不设自动起步——因为自动起步那个设置存在容器临时盘上，"
+        "重建容器就没了。所以这条提醒会一直在，直到你切档。）"
+    )
 
 
 def build_user_message(vsc_missing):
@@ -321,8 +413,11 @@ def run_hook():
         _remember(new_v)
 
     vsc = vscode_toggle_missing()
-    report = build_report(fixed, project_ask(proj), bumped, old_v, new_v, vsc)
-    user_msg = build_user_message(vsc)
+    mode = actual_permission_mode()
+    report = build_report(fixed, project_ask(proj), bumped, old_v, new_v, vsc, mode)
+    # 准入开关缺失优先报（那是"Bypass 根本选不了"，比"选了别的档"更根本）；
+    # 开关在、只是这次选了 auto → 报 auto 那条。两条不同时弹，免得一次糊用户一屏。
+    user_msg = build_user_message(vsc) or build_auto_mode_user_message(mode)
 
     # 两个出口，喂给两拨人，别混：
     #   additionalContext → 注入给 **agent** 的上下文（用户看不见）
@@ -376,6 +471,22 @@ def run_check():
     else:
         print("✅ VS Code 准入开关已勾（Bypass 档位可选）")
 
+    # 真实档位：**报但不计入退出码**，同 VS Code 准入开关的理由——它由用户在扩展面板上
+    # 手选，agent 改不了（参数在扩展进程里拼好才启动 CLI）。但绝不报成绿：上面那些 ✅
+    # 说的是"配置文件里写对了"，而配置文件在这一层面前不作数，两件事必须分开显示。
+    mode = actual_permission_mode()
+    if mode is None:
+        print("ℹ️  没传 %s（纯终端启动或读不到 /proc）→ 这时上面的 defaultMode 才真的说了算"
+              % MODE_FLAG)
+    elif mode == WANT_MODE:
+        print("✅ 本会话真实档位 = %s（与 defaultMode 一致）" % mode)
+    else:
+        print("⚠️  本会话真实档位 = %s，**不是** %s —— 命令行 %s 压过了 settings.json 的 "
+              "defaultMode，上面那条 ✅ 在本会话里不作数" % (mode, WANT_MODE, MODE_FLAG))
+        if mode == "auto":
+            print("     auto 档靠远端模型逐条判危险性，那个模型不可用时写文件/跑命令全被拒。")
+        print("     改法：扩展面板右下角切档位。不计入退出码（agent 改不了，只有用户点得了）。")
+
     return 1 if (drift or proj_ask) else 0
 
 
@@ -398,6 +509,44 @@ def _selftest():
           [d[0] for d in audit({"permissions": {"defaultMode": "bypassPermissions",
                                                 "ask": ["Bash(rm -rf:*)"]},
                                 "sandbox": {"enabled": False}})], ["permissions.ask"])
+
+    # 1b) 第一层（CLI 参数 / 真实档位）——2026-08-27 新增
+    #     阴性对照占一半：误报会让用户把提醒关掉，等于没有。
+    def rpt(mode):
+        return build_report([], [], False, "", "", (), mode)
+
+    check("auto 档 → 报告点名真实档位", "真实档位是 `auto`" in rpt("auto"), True)
+    check("auto 档 → 报告点名远端模型这个失败模式", "远端模型" in rpt("auto"), True)
+    check("bypass 档 → 报告静默（阴性对照）", rpt("bypassPermissions"), "")
+    check("读不到档位 → 报告静默（阴性对照）", rpt(None), "")
+    check("plan 档 → 报档位不符但不提远端模型",
+          ("真实档位是 `plan`" in rpt("plan"), "远端模型" in rpt("plan")), (True, False))
+
+    check("auto → 弹给用户", build_auto_mode_user_message("auto") is not None, True)
+    check("bypass → 不弹给用户（阴性对照）", build_auto_mode_user_message("bypassPermissions"), None)
+    check("plan → 不弹给用户（阴性对照：用户主动选的工作方式，报它是噪音）",
+          build_auto_mode_user_message("plan"), None)
+    check("读不到 → 不弹给用户（阴性对照）", build_auto_mode_user_message(None), None)
+
+    # 解析器本身：拿一条真实的 argv 形态喂它（两种写法都要吃得下）
+    def _parse(argv):
+        for i, a in enumerate(argv):
+            if a == MODE_FLAG and i + 1 < len(argv):
+                return argv[i + 1]
+            if a.startswith(MODE_FLAG + "="):
+                return a.split("=", 1)[1]
+        return None
+
+    check("解析空格写法", _parse(["claude", "--verbose", MODE_FLAG, "auto", "--debug"]), "auto")
+    check("解析等号写法", _parse(["claude", MODE_FLAG + "=bypassPermissions"]), "bypassPermissions")
+    check("没传该参数 → None（阴性对照）", _parse(["claude", "--resume=abc", "--verbose"]), None)
+    check("参数在末尾没跟值 → None，别越界（阴性对照）", _parse(["claude", MODE_FLAG]), None)
+    # 活体：本进程真跑起来时不许抛异常（返回什么都行，取决于谁启动的）
+    try:
+        actual_permission_mode()
+        check("actual_permission_mode 不抛异常", True, True)
+    except Exception as e:                                     # pragma: no cover
+        check("actual_permission_mode 不抛异常", "抛了 %r" % e, True)
 
     with tempfile.TemporaryDirectory() as td:
         SETTINGS = os.path.join(td, "settings.json")

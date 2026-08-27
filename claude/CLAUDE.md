@@ -139,24 +139,57 @@
   它 `scope` 是 `machine`,在devcontainer里勾User层无效、必须勾 `Remote [Dev Container]`,
   这与上面「静态偏好放User」的通则相反(2026-08-09踩到，我曾据通则误报"勾User层")。**
 
-### 不弹窗这件事：**五个**开关分属五层，缺一个就照弹(2026-08-09第三次改正)
+### 不弹窗这件事：**六个**开关分属六层，缺一个就照弹(2026-08-27第四次改正)
 
 用户诉求(原话)「BASH确认弹窗我看不懂、都会点yes，莫不如完全不要问我，你执行到结束
 再告诉我做了什么，有问题我让你回溯」;2026-08-09复述并加码「这种不断的提醒只会拖慢我
 执行任务的节奏……能不能这些弹窗都不允许弹，或者都默认是yes」。
 
-**本条已被改正三次，形态每次都一样：以为齐了、其实还有一层没堵。** 第一次(08-08)以为是
+**本条已被改正四次，形态每次都一样：以为齐了、其实还有一层没堵。** 第一次(08-08)以为是
 一个开关、实为两个；第二次(08-09)以为是两个、实为四个；第三次(08-09同日)以为四层已齐，
-**实为五层，且第二层我连"勾在哪"都写错了**。**判据别再问「开关设对没有」,
-要问「还有没有别的层也能弹」**——五层互不相干、各弹各的：
+**实为五层，且第二层我连"勾在哪"都写错了**；第四次(2026-08-27)发现**最上面还压着一层
+CLI参数**——而且在VS Code扩展场景里**它才是真正决定档位的那个**,底下五层全绿也不作数。
+**判据别再问「开关设对没有」,要问「还有没有别的层也能弹」**——六层互不相干、各弹各的
+(**下表按优先级从高到低排，上面的压下面的**)：
 
 | 层 | 开关 | 决定什么 | 谁来设 |
 |---|---|---|---|
-| 权限模式 | `permissions.defaultMode: "bypassPermissions"` | 新会话起步在哪个模式 | agent可准备(dotfiles的`settings-permissions.json`+`merge_settings.py`) |
+| **CLI参数(最高，2026-08-27新增)** | 启动命令行的 `--permission-mode <档>` | **直接定死本会话的档位，压过下面所有配置文件**。VS Code扩展**每次都显式传它**,值取自扩展面板上那个模式选择器 | 用户在扩展面板手选；agent改不了(参数在扩展进程里拼好才启动CLI) |
+| 权限模式 | `permissions.defaultMode: "bypassPermissions"` | 新会话起步在哪个模式(**仅在CLI没传 `--permission-mode` 时才生效**) | agent可准备(dotfiles的`settings-permissions.json`+`merge_settings.py`) |
 | 客户端准入 | `claudeCode.allowDangerouslySkipPermissions` | 这个窗口**允不允许出现**该模式 | 用户自己勾；**`scope: machine`——devcontainer里必须勾 `Remote [Dev Container]` 标签页，勾User层无效** |
 | **起步档位** | `claudeCode.initialPermissionMode`(扩展2.1.226新增) | **新对话直接从哪一档起步，压过上面的`defaultMode`**;设 `manual`/`default` 即永远Manual起步 | 用户自己设；同为machine scope。**留空**才会听`defaultMode` |
 | **Bash沙箱** | `sandbox.enabled: false` | **新版CLI自己默认开的第三层，`bypassPermissions`完全管不到它** | agent，同dotfiles片段 |
 | **ask名单** | `permissions.ask` **两处都要清**:用户级(走`_ask_retired`退役通道)+ **项目级仓库的`.claude/settings.json`** | 一份「这几条必须问一次」的清单 | agent；**只清一边等于没做** |
+
+**第一层的坑：配置文件永远赢不了命令行，而我们守了三轮的正是配置文件**
+(2026-08-27实测)。VS Code扩展启动CLI时长这样(从 `/proc/<pid>/cmdline` 逐字读出)：
+`claude --output-format stream-json … --permission-mode auto --allow-dangerously-skip-permissions`。
+`--permission-mode` 一旦显式传值，`~/.claude/settings.json` 里的 `defaultMode` **完全不被读**。
+后果比"没生效"更坏：**`no-prompt-guard.py` 每次开机尽责地把 `defaultMode` 写回
+`bypassPermissions`、`--check` 四项全过、doctor全绿——而实际档位是扩展面板上选的那个**。
+这不是"闸门失效",是**闸门在认真地守一个不管用的键**,它每次都报绿，所以三轮排障都没怀疑到它。
+**判据升级**:判档位不要读 `settings.json`,读 `tr '\0' ' ' < /proc/<claude_pid>/cmdline`
+里的 `--permission-mode`——那才是这个会话真正在跑的档。同一容器里不同会话可以是不同档
+(实测一个 `auto`、一个 `bypassPermissions`),这本身就证明档位是逐会话选的、不是配置定的。
+
+**顺带认识第六档 `auto`(2026-08-27新增，此前本文件从没提过)**。CLI二进制里的官方定义逐字是：
+`'auto' - Use a model classifier to approve/deny permission prompts.`
+（对照：`'bypassPermissions' - Bypass all permission checks`;
+`'dontAsk' - Don't prompt for permissions, deny if not pre-approved`。）
+**关键差别是它靠一个远端模型判"这条命令危不危险"**,于是那个模型不可用时，
+auto档**什么都写不了、什么命令都跑不了**,报
+`<model> is temporarily unavailable, so auto mode cannot determine the safety of Write right now`,
+而只读操作照常。2026-08-26~27社区大面积撞上，手动档不受影响——因为只有auto问它。
+**可迁移的元教训：把权限判定外包给远端模型，等于给日常干活加了一个新的单点故障；
+`bypassPermissions` 是纯本地判定、零外部依赖，这是选它而非auto的第二个理由**
+(第一个理由是不打扰用户)。
+auto档另有一套自己的配置 `autoMode.{environment, allow, soft_deny, hard_deny, deny}`
+(字符串数组，落 `~/.claude/settings.json` 或项目 `.claude/settings.local.json`),
+交互式生成走 `/auto-mode-setup`,重置走 `claude auto-mode reset`。
+**⚠️ 未验证**:"命中 `autoMode.allow` 是否就完全不问那个远端模型"——这是推断，没有一手证据，
+别拿它当分类器故障时的救生索。**用户2026-08-27已定：不设自动起步档，每次在扩展面板手选
+Bypass**(理由是 `claudeCode.initialPermissionMode` 落在容器overlay盘、rebuild即清空,
+"与其重建后从零开始，不如现在就养成手选的习惯")。
 
 **第二层的坑：`scope: machine` 与本文件「静态偏好放User」的通则相反，别照通则推**
 (2026-08-09实测)。VS Code的machine作用域设置在remote/devcontainer窗口里**只认容器侧的值**,
@@ -209,6 +242,12 @@ without it"说的只是不能在会话**中途**切进去，不是"每次都要�
 被误判为不可能、白绕了两轮。**教训可迁移：把文档里的『不能中途改』读成『每次都要手动设』,
 是把runtime限制误当成config限制——遇到"只能启动时生效"的说法，先去查有没有对应的
 持久化配置键。**
+**⚠️ 2026-08-27再补一刀，本段结论只对纯CLI成立**：`defaultMode` 确实是持久默认，
+**但只在没人传 `--permission-mode` 时**;而VS Code扩展**每次都传**。所以在扩展里
+"写进用户级settings就是持久默认"**是假的**,真正的持久默认是扩展面板上选的档。
+两条纠正连起来看是同一个病的两面：第一次把runtime限制误当config限制(以为做不成持久),
+这次把config限制误当runtime保证(以为写进配置就一定生效)——**都是没去看进程真正拿到了
+什么参数**。
 
 **五层全关后仍会弹的，只剩这几类，刻意保留**:① **质量闸门hook**(WY仓14个
 `*-delivery-gate`/`*-guard`,只在**交付PPT/Word那一刻**查数据绑没绑原文、引文格式、
