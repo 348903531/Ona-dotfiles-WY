@@ -160,7 +160,7 @@ def check_partitioning(mem_dir: Path) -> list[str]:
         return []
 
     facts = [p for p in mem_dir.glob("*.md")
-             if p.stem not in ("MEMORY", "README") and not p.stem.startswith("_index_")]
+             if p.stem not in ("MEMORY", "_README") and not p.stem.startswith("_index_")]
 
     dom_of: dict[str, str | None] = {}
     for p in facts:
