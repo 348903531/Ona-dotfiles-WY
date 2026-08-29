@@ -71,6 +71,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sys
 from pathlib import Path
 
@@ -132,6 +133,106 @@ def measure(idx: Path) -> dict | None:
     }
 
 
+def check_partitioning(mem_dir: Path) -> list[str]:
+    """分域腐化检查：只在项目启用了分域（有 domains.json）时才查。
+
+    为什么要有它（2026-08-29 当场撞见）
+    ------------------------------------
+    分域刚做完、还没提交，**另一个会话就按旧规则往 MEMORY.md 末尾追加了一条新
+    memory**——没有 domain、不属于任何域。它功能上还能被读到，但每多一条这样的，
+    常驻索引就长回去一点；半年后就腐化回平铺，81% 的收益一点点漏光。
+
+    腐化是**渐进且无声**的，正是最该做成机械检查的那类：判据完全确定
+    （有没有 domain 字段 / 在不在索引里 / 是不是非 always 却写进了 MEMORY.md），
+    零语义判断、零误报可能。
+
+    刻意只报三件事，且只在真出问题时开口（没启用分域的项目完全静默）。
+    """
+    conf = mem_dir / "domains.json"
+    if not conf.is_file():
+        return []                        # 该项目没启用分域 → 不是它的规矩，不管
+    try:
+        import json as _json
+        doms = _json.loads(conf.read_text(encoding="utf-8")).get("domains", [])
+        resident = {d["id"] for d in doms if d.get("resident")}
+        valid = {d["id"] for d in doms}
+    except Exception:
+        return []
+
+    facts = [p for p in mem_dir.glob("*.md")
+             if p.stem not in ("MEMORY", "README") and not p.stem.startswith("_index_")]
+
+    dom_of: dict[str, str | None] = {}
+    for p in facts:
+        try:
+            m = re.search(r"^\s+domain:\s*(\S+)\s*$", p.read_text(encoding="utf-8"), re.M)
+        except OSError:
+            continue
+        dom_of[p.stem] = m.group(1) if m else None
+
+    problems = []
+
+    # ① 缺 domain / 域名写错 —— 新加的 memory 最常见的两种漏
+    no_dom = [s for s, d in dom_of.items() if d is None]
+    bad_dom = [s for s, d in dom_of.items() if d is not None and d not in valid]
+    if no_dom:
+        problems.append(
+            f"**{len(no_dom)} 条 memory 缺 `domain`**（新加的忘了写？）："
+            + "、".join(sorted(no_dom)[:4]) + ("…" if len(no_dom) > 4 else "")
+        )
+    if bad_dom:
+        problems.append(
+            f"**{len(bad_dom)} 条 memory 的 domain 不在 domains.json 里**："
+            + "、".join(sorted(bad_dom)[:4])
+        )
+
+    # ② 非 always 域却写进了 MEMORY.md —— 这就是「按旧规则往末尾追加」的指纹
+    try:
+        top = (mem_dir / "MEMORY.md").read_text(encoding="utf-8")
+    except OSError:
+        top = ""
+    misplaced = []
+    for ln in top.splitlines():
+        m = re.match(r"^-\s*\[[^\]]+\]\(([^)/]+)\.md\)", ln.strip())
+        if m:
+            stem = m.group(1)
+            d = dom_of.get(stem)
+            if d is not None and d not in resident:
+                misplaced.append(f"{stem}（应在 _index_{d}.md）")
+            elif stem not in dom_of:
+                misplaced.append(f"{stem}（索引里有、盘上没有）")
+    if misplaced:
+        problems.append(
+            f"**{len(misplaced)} 条本该在分域索引里，却写进了常驻的 MEMORY.md**："
+            + "、".join(misplaced[:4]) + ("…" if len(misplaced) > 4 else "")
+        )
+
+    # ③ 在盘不在任何索引 —— 写了文件忘了加索引行，等于没写
+    indexed: set[str] = set()
+    for f in [mem_dir / "MEMORY.md"] + sorted(mem_dir.glob("_index_*.md")):
+        try:
+            for ln in f.read_text(encoding="utf-8").splitlines():
+                m = re.match(r"^-\s*\[[^\]]+\]\(([^)/]+)\.md\)", ln.strip())
+                if m:
+                    indexed.add(m.group(1))
+        except OSError:
+            pass
+    orphans = sorted(set(dom_of) - indexed)
+    if orphans:
+        problems.append(
+            f"**{len(orphans)} 条 memory 不在任何索引里**（写了文件忘了加索引行 = 永远不会被读到）："
+            + "、".join(orphans[:4]) + ("…" if len(orphans) > 4 else "")
+        )
+
+    if problems:
+        problems.append(
+            "→ 一条命令修：`python3 .claude/memory/scripts/rebuild_indexes.py`"
+            "（幂等、自带对账；缺 domain 的要先手写 `metadata.domain`）。"
+            "规矩见 `.claude/memory/README.md`。"
+        )
+    return problems
+
+
 def build_message(m: dict) -> str:
     cp, n = m["codepoints"], m["entries"]
     pct = cp * 100 // BUDGET_CP
@@ -186,13 +287,22 @@ def run_hook() -> int:
         cwd = _resolve_cwd(payload)
         if _project_hook_present(cwd):
             return 0                      # 项目级同名 hook 会报，这里让位
-        m = measure(index_path_for(cwd))
-        if not m or not m["over"]:
-            return 0                      # 没有 memory / 没超 → 静默
+        idx = index_path_for(cwd)
+        m = measure(idx)
+        if not m:
+            return 0                      # 该项目没有 memory 索引 → 静默
+        msgs = []
+        if m["over"]:
+            msgs.append(build_message(m))
+        rot = check_partitioning(idx.parent)
+        if rot:
+            msgs.append("【memory 分域腐化】\n" + "\n".join(f"· {r}" for r in rot))
+        if not msgs:
+            return 0                      # 都没问题 → 静默
         print(json.dumps({
             "hookSpecificOutput": {
                 "hookEventName": "SessionStart",
-                "additionalContext": build_message(m),
+                "additionalContext": "\n\n".join(msgs),
             }
         }))
     except Exception:
@@ -212,14 +322,24 @@ def run_check(cwd: Path | None = None) -> int:
         f"{status}  MEMORY.md {m['codepoints']:,} cp / 预算 {BUDGET_CP:,} cp"
         f"  ·  {m['entries']} 条条目  ·  超长行 {len(m['long_lines'])} 条"
     )
+    rc = 0
     if m["over"]:
         print()
         print(build_message(m))
-        return 1
-    return 0
+        rc = 1
+    rot = check_partitioning(index_path_for(cwd).parent)
+    if rot:
+        print("\n🔴 分域腐化：")
+        for r in rot:
+            print(f"  · {r}")
+        rc = 1
+    elif (index_path_for(cwd).parent / "domains.json").is_file():
+        print("✅ OK  分域完整（每条都有合法 domain、都在索引里、常驻区只有 always）")
+    return rc
 
 
 def _selftest() -> int:
+    import json
     import tempfile
 
     passed, failed = [], []
@@ -282,6 +402,59 @@ def _selftest() -> int:
         finally:
             if real_home is not None:
                 os.environ["HOME"] = real_home
+
+        # ── 分域腐化检查 ────────────────────────────────────────────
+        # 阴性对照最要紧：没启用分域的项目必须完全静默，否则这道检查会在
+        # 每一个没用分域的仓库里天天报错，人三天就学会忽略它。
+        pdir = tmp / "pmem"
+        pdir.mkdir()
+        (pdir / "MEMORY.md").write_text("- [a](a.md) — x\n", encoding="utf-8")
+        (pdir / "a.md").write_text("---\nmetadata:\n  type: feedback\n---\nx\n", encoding="utf-8")
+        check("阴性·没有 domains.json 时完全静默", check_partitioning(pdir), [])
+
+        (pdir / "domains.json").write_text(json.dumps({"domains": [
+            {"id": "always", "resident": True}, {"id": "ppt"}, {"id": "git"},
+        ]}), encoding="utf-8")
+        # a.md 缺 domain → 该报
+        r = check_partitioning(pdir)
+        check("缺 domain 被抓到", any("缺 `domain`" in x for x in r), True)
+
+        # 补上合法 domain=always 且在 MEMORY.md 里 → 干净
+        (pdir / "a.md").write_text(
+            "---\nmetadata:\n  type: feedback\n  domain: always\n---\nx\n", encoding="utf-8")
+        check("阴性·always 在 MEMORY.md 里不报", check_partitioning(pdir), [])
+
+        # 非 always 域却写在 MEMORY.md → 这是「按旧规则往末尾追加」的指纹
+        (pdir / "b.md").write_text(
+            "---\nmetadata:\n  type: feedback\n  domain: ppt\n---\nx\n", encoding="utf-8")
+        (pdir / "MEMORY.md").write_text("- [a](a.md) — x\n- [b](b.md) — y\n", encoding="utf-8")
+        r = check_partitioning(pdir)
+        check("非 always 写进 MEMORY.md 被抓到",
+              any("却写进了常驻的 MEMORY.md" in x for x in r), True)
+
+        # 挪进分域索引 → 干净
+        (pdir / "MEMORY.md").write_text("- [a](a.md) — x\n", encoding="utf-8")
+        (pdir / "_index_ppt.md").write_text("- [b](b.md) — y\n", encoding="utf-8")
+        check("阴性·挪进分域后不报", check_partitioning(pdir), [])
+
+        # 写了文件但没进任何索引 → 等于没写
+        (pdir / "c.md").write_text(
+            "---\nmetadata:\n  type: feedback\n  domain: git\n---\nx\n", encoding="utf-8")
+        r = check_partitioning(pdir)
+        check("孤儿被抓到", any("不在任何索引里" in x for x in r), True)
+
+        # 域名写错 → 该报
+        (pdir / "c.md").write_text(
+            "---\nmetadata:\n  type: feedback\n  domain: 打错的域\n---\nx\n", encoding="utf-8")
+        (pdir / "_index_git.md").write_text("- [c](c.md) — z\n", encoding="utf-8")
+        r = check_partitioning(pdir)
+        check("非法 domain 被抓到", any("不在 domains.json 里" in x for x in r), True)
+
+        # _index_*.md 与 README.md 本身不该被当成 fact 去查 domain
+        (pdir / "README.md").write_text("# 说明\n", encoding="utf-8")
+        (pdir / "c.md").write_text(
+            "---\nmetadata:\n  type: feedback\n  domain: git\n---\nx\n", encoding="utf-8")
+        check("阴性·README 与 _index_ 不当 fact", check_partitioning(pdir), [])
 
         # ── 项目级同名 hook 存在 → 让位 ─────────────────────────────
         (proj / ".claude" / "hooks").mkdir(parents=True)
