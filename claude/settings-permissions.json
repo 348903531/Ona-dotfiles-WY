@@ -54,6 +54,17 @@
     ],
     "PreToolUse": [
       {
+        "matcher": "Write",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "GUARD=\"$HOME/.claude/hooks/memory-frontmatter-guard.py\"; [ -f \"$GUARD\" ] && python3 \"$GUARD\" || exit 0"
+          }
+        ],
+        "description": "Memory frontmatter guard (user-level): 新 memory 落盘那一刻必须带 metadata.domain，否则 deny。为什么在这一层堵——memory 分域之后，没有 domain 的条目不属于任何分域索引，memory-domain-loader 永远不会注入它，等于写了个读不到的文件。2026-08-29 真实经过：分域刚做完、PR 还没合，另一个会话就按旧规则写了一条没 domain 的 memory；当时的处理是「不碰别人的文件，等下游检查提醒」——用户追问「你现在能不能解决」，逼出正解：别问「这一条怎么办」，问「怎么让以后所有条都不会缺」。下游两道（开局分域腐化检查 + health-check）只能发现已发生的事，本 hook 让它根本写不出来。用 deny 不用 ask：加一行 domain 纯技术执行，弹给用户只会得到 yes、纯打断（AGENTS.md 卡#27）。只管 Write（新建/整文件覆盖），Edit 局部改已有 memory 不查（那时 domain 早在了，查它只是噪音）。项目没有 .claude/memory/domains.json（= 没启用分域）完全静默。判据与 memory_lint 的筛选规则保持一致（.md 且不叫 MEMORY.md 且不以 _ 开头）——判据有两份必漂移。自测 12/12 含 7 条阴性对照。逃生阀 MEMORY_FRONTMATTER_GUARD_SKIP=1。",
+        "id": "pretooluse:memory-frontmatter-guard"
+      },
+      {
         "matcher": "Bash",
         "hooks": [
           {
