@@ -39,6 +39,19 @@
         "id": "sessionstart:memory-index-budget-guard"
       }
     ],
+    "UserPromptSubmit": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "GUARD=\"$HOME/.claude/hooks/memory-domain-loader.py\"; [ -f \"$GUARD\" ] && python3 \"$GUARD\" || exit 0"
+          }
+        ],
+        "description": "Memory domain loader (user-level): 按当天任务只注入相关那批 memory 索引。配套 memory-index-budget-guard——那个负责喊「索引涨太大了」，这个负责让它不必再涨。机制：MEMORY.md 由 harness【原生全量注入】、hook 拦不住，所以降常驻开销的唯一办法是让它本身变短——always 域（跨任务恒成立）留在 MEMORY.md 原样常驻，其余按域拆进 .claude/memory/domains/<id>.md，本 hook 在 prompt 进来时按关键词判任务类型、把相关域的子索引注入。实测（WY-workspace-P，115 条）：常驻索引 15,209 → 2,834 codepoints，降 81%，一条没丢；真实 prompt 干跑「EHA摘要做成中文幻灯」正确同时命中 lit+ppt、「开分支提PR」命中 git、闲聊静默。域定义放项目（.claude/memory/domains.json）、机制放 dotfiles，读不到域定义就静默退化成不注入（fail-safe，不比拆分前差）。与 task-rule-injector 分工：那个注入 AGENTS.md 的硬规定（该看哪张卡、跑哪个闸门），这个注入 memory 里的经验事实（这类活以前踩过什么坑）；两者关键词表刻意各自维护——memory 里的 corpus（资料库在哪）/ gatecraft（造闸门方法）在 AGENTS 卡片分类里根本没有对应类型。宁多勿漏（命中多个域就都注入，上限 3 个）；每会话每域只注入一次；注入索引行不注入正文（正文动辄几千字，全量注入等于把省下的开销还回去）。诚实边界：关键词会漏也会误，漏的那次那条 memory 等于不存在——所以 MEMORY.md 里保留「其余在 domains/、可直接 grep」的指引，本 hook 不是唯一入口。自测 17/17 含 4 条阴性对照（闲聊/空 prompt/无关技术词/未启用分域）。逃生阀 MEMORY_DOMAIN_LOADER_SKIP=1。",
+        "id": "userpromptsubmit:memory-domain-loader"
+      }
+    ],
     "PreToolUse": [
       {
         "matcher": "Bash",
