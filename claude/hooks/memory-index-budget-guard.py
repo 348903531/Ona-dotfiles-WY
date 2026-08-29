@@ -1,0 +1,307 @@
+#!/usr/bin/env python3
+r"""memory-index-budget-guard — memory 索引涨到什么程度了？没有刹车就会无声涨下去。
+
+为什么有它（2026-08-29 实测发现的缺口）
+========================================
+文件式 memory 的加载是**两层**，这一点决定了成本结构：
+
+    第一层 · 索引 MEMORY.md   每条一行  → 每次会话【全量注入】，固定开销
+    第二层 · 正文 <name>.md   完整事实  → 只在 agent 判断相关时才单独 Read
+
+所以真正的常驻成本**只有索引**。正文再多也不自动进 context。
+但索引是**只增不减**的：每沉淀一条就加一行，没有任何东西在盯着它涨到哪了。
+
+实测（本机 WY-workspace-P，2026-08-29）：115 条 memory，索引 **15,029 codepoints**
+（≈1.4 万 token，每次会话都读一遍）。按这个写法外推，1000 条 ≈ 13 万 token 常驻，
+而其中绝大多数与当天任务无关——那时候「加了也白加」就从个例变成常态。
+
+同族参照：本仓另一套 lessons-index 规模 159 条、注入预算 9000 字符，实测
+**只进 45 条**，注入报文末尾自己写着「有 35 条无兜底教训也没塞进来」。
+**那 35 条就是「白加」真实发生的样子。** memory 这套还没有预算机制，
+所以它不会像 lessons-index 那样「挤不进来」，而是**全都挤进来、悄悄吃掉上下文**。
+
+判据为什么可机械化
+------------------
+「索引有多大」是纯数数，零语义判断、零误报可能。属 AGENTS.md 卡#18 里
+「有稳定可判信号」的那一档——能做成闸门就别只写散文。
+
+⚠️ 口径：必须数 **codepoints**（`len(text)`），不是字节。
+中文 1 字 = 3 字节，拿 `wc -c` 的数去比字符阈值会虚高约 2 倍
+（本机实测同一文件：27,095 字节 vs 15,029 codepoints）。
+**本 hook 的作者第一次口述这个数时就踩了这个坑**，把字节说成了字符、
+据此判断「已超预算」，实际还有三成余量——所以这里写死用 len()，
+并在报文里显式标注单位。
+
+阈值怎么定的（刻意不设成「当前值」）
+------------------------------------
+设 20,000 codepoints。当前 15,029 → **今天是绿的**，还能再加约 40 条才响。
+
+这是刻意的：闸门一挂上就恒红，人会立刻学会忽略它——本仓已有一条教训
+（「恒定假红的测试会拦死整个 skill」）记的正是这个。**刹车的意义不是现在就停车，
+是别让它无声地涨下去。**
+
+超了之后该做什么（报文会说，这里记原因）
+----------------------------------------
+两条出路，先做便宜的：
+  ① 压缩最长的那几行索引 —— 索引行的职责只是「什么情况下你需要我」，
+     不是摘要正文。超过 ~120 codepoints 的行基本都能压。
+  ② 分区加载 —— 给每条打 domain 标签，按当天任务只注入相关那批
+     （lessons-index + task-rule-injector 已是这个形态，可照抄）。
+  ③ 退役 —— 只清 project 类里已被证伪/已过期的；feedback 与 user 类
+     **不因年龄退役**（工作方式的要求越老越可能是对的，它老恰恰因为写对了）。
+
+诚实边界
+--------
+- 只量索引大小，**判不了「哪条该删」**——那是语义判断，机器做必错。
+- 只报告、不阻断（SessionStart 硬拦会卡死会话启动）。
+- 数的是 codepoints，与真实 token 数不完全相等（中文≈1:1，英文≈1:0.3），
+  作为**趋势指标**足够，不当精确账单用。
+
+用法
+----
+  SessionStart hook：读 stdin JSON，超阈值则注入 additionalContext，永远 exit 0
+  python3 memory-index-budget-guard.py --check     # 超阈值真的 exit 1，给 CI/doctor 用
+  python3 memory-index-budget-guard.py --selftest  # 含阴性对照
+  MEMORY_INDEX_BUDGET_GUARD_SKIP=1                 # 逃生阀
+
+落点：`~/dotfiles/claude/hooks/`（层④跨项目）——任何项目的 memory 索引都会涨，
+不是本仓专属。项目级若有同名 hook 则静默让位，不重复报。
+"""
+from __future__ import annotations
+
+import json
+import os
+import sys
+from pathlib import Path
+
+# 索引预算（codepoints，不是字节——见 docstring 的口径警告）。
+# 当前基线 15,029（115 条）；设 20,000 留约 40 条余量，保证挂上去当天是绿的。
+BUDGET_CP = 20_000
+
+# 索引行超过这个长度就点名为「可压缩」。120 cp 约等于一句话 + 一个钩子，够用了。
+LONG_LINE_CP = 120
+
+# 报文里最多点名几条最长的行——列太多没人看，5 条足够指出方向。
+TOP_N = 5
+
+ESCAPE_ENV = "MEMORY_INDEX_BUDGET_GUARD_SKIP"
+
+# 项目级同名 hook 存在时让位，避免同一件事报两遍（dotfiles 用户级 hook 的既有约定）。
+PROJECT_HOOK_NAMES = ("memory-index-budget-guard.py",)
+
+
+def _project_hook_present(cwd: Path) -> bool:
+    for name in PROJECT_HOOK_NAMES:
+        if (cwd / ".claude" / "hooks" / name).is_file():
+            return True
+    return False
+
+
+def slug_for(cwd: Path) -> str:
+    """Claude Code 的项目目录名规则：绝对路径里的 '/' 换成 '-'。
+
+    /workspaces/WY-workspace-P  ->  -workspaces-WY-workspace-P
+    """
+    return str(cwd).replace("/", "-")
+
+
+def index_path_for(cwd: Path, home: Path | None = None) -> Path:
+    home = home or Path.home()
+    return home / ".claude" / "projects" / slug_for(cwd) / "memory" / "MEMORY.md"
+
+
+def measure(idx: Path) -> dict | None:
+    """量索引。文件不存在/读不了 → None（fail-open，静默）。"""
+    try:
+        text = idx.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        return None
+
+    lines = [ln.rstrip("\n") for ln in text.splitlines()]
+    entries = [ln for ln in lines if ln.lstrip().startswith("- ")]
+    long_lines = sorted(
+        (ln for ln in entries if len(ln) > LONG_LINE_CP),
+        key=len,
+        reverse=True,
+    )
+    return {
+        "codepoints": len(text),          # ← len()，不是 os.path.getsize()
+        "entries": len(entries),
+        "long_lines": long_lines,
+        "over": len(text) > BUDGET_CP,
+    }
+
+
+def build_message(m: dict) -> str:
+    cp, n = m["codepoints"], m["entries"]
+    pct = cp * 100 // BUDGET_CP
+    head = (
+        f"【memory 索引超预算】MEMORY.md 现 **{cp:,} codepoints**（{n} 条条目），"
+        f"超出 {BUDGET_CP:,} 的预算，已达 {pct}%。\n"
+        f"这段是**每次会话全量注入**的固定开销——它涨，每一轮对话都跟着变贵，"
+        f"而其中大多数条目与当天任务无关。"
+    )
+
+    body = [head, "", "**先做便宜的那一步**："]
+    longs = m["long_lines"]
+    if longs:
+        body.append(
+            f"① 压缩最长的索引行（>{LONG_LINE_CP} cp 的有 {len(longs)} 条）。"
+            f"索引行的职责只是「什么情况下你需要我」，不是摘要正文："
+        )
+        for ln in longs[:TOP_N]:
+            body.append(f"   · {len(ln)} cp — {ln[:70]}…")
+    body += [
+        "② 分区加载：给每条打 domain 标签，按当天任务只注入相关那批"
+        "（lessons-index + task-rule-injector 已是这个形态，可照抄）。",
+        "③ 退役：**只清 project 类**里已被证伪/已过期的。"
+        "feedback 与 user 类不因年龄退役——工作方式的要求越老越可能是对的。",
+        "",
+        f"（判不了「哪条该删」，那是语义判断；本 hook 只负责在它无声涨下去时喊一声。"
+        f"逃生阀 `{ESCAPE_ENV}=1`。）",
+    ]
+    return "\n".join(body)
+
+
+def _resolve_cwd(payload: dict | None = None) -> Path:
+    if payload:
+        for key in ("cwd", "project_dir", "projectDir"):
+            v = payload.get(key)
+            if v:
+                return Path(v)
+    env = os.environ.get("CLAUDE_PROJECT_DIR")
+    return Path(env) if env else Path.cwd()
+
+
+def run_hook() -> int:
+    if os.environ.get(ESCAPE_ENV):
+        return 0
+    try:
+        raw = sys.stdin.read()
+        payload = json.loads(raw) if raw.strip() else {}
+    except Exception:
+        payload = {}
+
+    try:
+        cwd = _resolve_cwd(payload)
+        if _project_hook_present(cwd):
+            return 0                      # 项目级同名 hook 会报，这里让位
+        m = measure(index_path_for(cwd))
+        if not m or not m["over"]:
+            return 0                      # 没有 memory / 没超 → 静默
+        print(json.dumps({
+            "hookSpecificOutput": {
+                "hookEventName": "SessionStart",
+                "additionalContext": build_message(m),
+            }
+        }))
+    except Exception:
+        return 0                          # fail-open：绝不因为这道自查卡住会话
+    return 0
+
+
+def run_check(cwd: Path | None = None) -> int:
+    """给 doctor / CI 用：超预算真的 exit 1。"""
+    cwd = cwd or _resolve_cwd()
+    m = measure(index_path_for(cwd))
+    if not m:
+        print(f"⏭️  SKIP：{index_path_for(cwd)} 读不到（该项目没有 memory 索引）")
+        return 0
+    status = "🔴 OVER" if m["over"] else "✅ OK"
+    print(
+        f"{status}  MEMORY.md {m['codepoints']:,} cp / 预算 {BUDGET_CP:,} cp"
+        f"  ·  {m['entries']} 条条目  ·  超长行 {len(m['long_lines'])} 条"
+    )
+    if m["over"]:
+        print()
+        print(build_message(m))
+        return 1
+    return 0
+
+
+def _selftest() -> int:
+    import tempfile
+
+    passed, failed = [], []
+
+    def check(name, got, want):
+        (passed if got == want else failed).append(f"{name}（got={got!r} want={want!r}）")
+
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        proj = tmp / "workspaces" / "demo"
+        proj.mkdir(parents=True)
+        home = tmp / "home"
+        mem = home / ".claude" / "projects" / slug_for(proj) / "memory"
+        mem.mkdir(parents=True)
+        idx = mem / "MEMORY.md"
+
+        # ── 阴性对照：小索引必须静默 ────────────────────────────────
+        idx.write_text("- [a](a.md) — 短钩子\n- [b](b.md) — 另一条\n", encoding="utf-8")
+        m = measure(idx)
+        check("阴性·小索引不报", m["over"], False)
+        check("阴性·条目数数对", m["entries"], 2)
+        check("阴性·无超长行", len(m["long_lines"]), 0)
+
+        # ── 阴性对照：正好卡在预算上不报（边界是 > 不是 >=）──────────
+        idx.write_text("x" * BUDGET_CP, encoding="utf-8")
+        check("阴性·正好等于预算不报", measure(idx)["over"], False)
+
+        # ── 阳性：超一个字符就报 ────────────────────────────────────
+        idx.write_text("x" * (BUDGET_CP + 1), encoding="utf-8")
+        check("阳性·超一个字符即报", measure(idx)["over"], True)
+
+        # ── 口径：中文必须按 codepoints 数，不能按字节 ───────────────
+        # 这是本 hook 存在的直接原因之一，钉死防回归。
+        cjk = "汉" * 1000                                  # 1000 cp / 3000 bytes
+        idx.write_text(cjk, encoding="utf-8")
+        check("口径·中文按 codepoints", measure(idx)["codepoints"], 1000)
+        check("口径·1000中文不该超2万预算", measure(idx)["over"], False)
+
+        # ── 超长行点名 ──────────────────────────────────────────────
+        idx.write_text(
+            "- [short](s.md) — 短\n"
+            + "- [long](l.md) — " + "长" * 200 + "\n",
+            encoding="utf-8",
+        )
+        m = measure(idx)
+        check("超长行·抓到 1 条", len(m["long_lines"]), 1)
+        check("超长行·短行不误报", m["long_lines"][0].startswith("- [long]"), True)
+
+        # ── 索引不存在 → None，绝不炸 ───────────────────────────────
+        check("缺文件·返回 None", measure(mem / "nope.md"), None)
+
+        # ── run_check 退出码：坏状态真的非 0 ────────────────────────
+        idx.write_text("x" * (BUDGET_CP + 1), encoding="utf-8")
+        real_home = os.environ.get("HOME")
+        try:
+            os.environ["HOME"] = str(home)
+            check("run_check(OVER)→1", run_check(proj), 1)
+            idx.write_text("- [a](a.md) — 短\n", encoding="utf-8")
+            check("run_check(OK)→0", run_check(proj), 0)
+        finally:
+            if real_home is not None:
+                os.environ["HOME"] = real_home
+
+        # ── 项目级同名 hook 存在 → 让位 ─────────────────────────────
+        (proj / ".claude" / "hooks").mkdir(parents=True)
+        (proj / ".claude" / "hooks" / "memory-index-budget-guard.py").write_text("#", encoding="utf-8")
+        check("让位·项目级 hook 在则不报", _project_hook_present(proj), True)
+
+    for line in passed:
+        print(f"  ✅ {line}")
+    for line in failed:
+        print(f"  ❌ {line}")
+    if failed:
+        print(f"\n❌ selftest 失败 {len(failed)}/{len(passed) + len(failed)}")
+        return 1
+    print(f"\n✅ selftest 全过（{len(passed)} 项，含 5 条阴性对照 + 2 条口径防回归）")
+    return 0
+
+
+if __name__ == "__main__":
+    if "--selftest" in sys.argv:
+        sys.exit(_selftest())
+    if "--check" in sys.argv:
+        sys.exit(run_check())
+    sys.exit(run_hook())

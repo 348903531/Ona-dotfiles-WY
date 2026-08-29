@@ -26,6 +26,17 @@
         ],
         "description": "No-prompt guard (user-level): 开机把「免弹窗」三项配置**自动修回去**，不是提醒。用户 2026-08-09 原话「为什么反复改了好多遍还是不能改成硬性的规定……不要只是提醒」——这条批评击中的是本仓最典型的失败形态：**每次都在「改配置」，从来没有东西在「守配置」**。三轮下来每轮都是「用户又被弹 → 人肉排查 → 改配置 → 宣布搞定」，而配置是一次性的，没人在开机时核一遍它还在不在（08-07 就被 welcome-claude.sh 整文件覆盖过）。守三项：permissions.defaultMode / sandbox.enabled / permissions.ask，都在 ~/.claude/settings.json、不进 git，逐键改写绝不整体重写（env 里的内网代理一个字节不动，有回归测试盯）。项目级 ask 只报告不自动改（那文件在 git 里，自动改会让工作区平白变脏）。CLI 版本变了会提示「可能有新的弹窗层」——沙箱当初就是这么冒出来的、读配置读不出来，只能靠对照实验。后门：settings.json 里写 \"_no_prompt_guard\": \"off\" 即完全让位。fail-open，绝不卡启动。自测 16/16（含坏状态退出码真非 0、env 保全、损坏文件不覆盖）。",
         "id": "sessionstart:no-prompt-guard"
+      },
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "GUARD=\"$HOME/.claude/hooks/memory-index-budget-guard.py\"; [ -f \"$GUARD\" ] && python3 \"$GUARD\" || exit 0"
+          }
+        ],
+        "description": "Memory index budget guard (user-level): 盯住 MEMORY.md 索引的体量，别让它无声涨下去。文件式 memory 是两层加载——索引每次会话【全量注入】、正文只在判断相关时才单独 Read，所以常驻成本只有索引，而索引只增不减、此前没有任何东西在量它。实测（2026-08-29，WY-workspace-P）115 条 memory / 索引 15,029 codepoints ≈ 1.4 万 token 每轮常驻；按此外推 1000 条 ≈ 13 万 token，其中绝大多数与当天任务无关，「加了也白加」就从个例变成常态。同族参照 lessons-index：159 条、预算 9000 字符，实测只进 45 条、报文自己写着「有 35 条无兜底教训也没塞进来」——那 35 条就是白加真实发生的样子。⚠️ 口径必须数 codepoints 不是字节（中文 1 字 3 字节，同一文件 27,095 bytes vs 15,029 cp，混用虚高约 2 倍；作者第一次口述这个数就踩了）。阈值 20,000 刻意高于当前值，保证挂上去当天是绿的——闸门一挂就恒红，人会立刻学会忽略它（本仓已有「恒定假红的测试会拦死整个 skill」这条教训）。刹车的意义不是现在停车，是别让它无声地涨。只报告不阻断（SessionStart 硬拦会卡死启动），判不了「哪条该删」（语义判断）。自测 13/13 含 5 条阴性对照 + 2 条中文口径防回归；真库判别力已双向验过（当前阈值绿、压到 10000 真红并点名到行）。逃生阀 MEMORY_INDEX_BUDGET_GUARD_SKIP=1；项目级同名 hook 存在时静默让位。",
+        "id": "sessionstart:memory-index-budget-guard"
       }
     ],
     "PreToolUse": [
