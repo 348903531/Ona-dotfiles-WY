@@ -84,13 +84,38 @@ _ona_window_title_heal() {
   [ -f "$s" ] || return 0
   command -v ona >/dev/null 2>&1 || return 0            # 非 Ona 环境，走人
 
-  # 60 秒节流。用 find -mmin 而不是 stat：后者取 mtime 的写法 GNU/BSD 不一致。
-  # stamp 存在且不满 1 分钟 → find 输出为空 → 这次跳过。
+  # 60 秒节流，防某些工具连开一串 shell 时猛刷 API。
+  # 刻意**不用** `find -mmin +1`：它只有分钟粒度、且是「严格大于」，实测真实阈值
+  # 是 120 秒而不是 60（2026-09-07：100 秒判「还新」、130 秒才判「已旧」）——注释
+  # 与行为对不上，本身就是下一个坑；本机 find 是 bfs，`-newermt` 又不吃相对时间。
+  # dotfiles 只在 Linux 容器里跑，`stat -c` 可用；取不到就当过期、宁可多跑一次。
   local stamp="${TMPDIR:-/tmp}/.ona-window-title.stamp"
-  [ -f "$stamp" ] && [ -z "$(find "$stamp" -mmin +1 2>/dev/null)" ] && return 0
-  : > "$stamp" 2>/dev/null || true
+  local now last
+  now="$(date +%s 2>/dev/null || echo 0)"
+  last="$(stat -c %Y "$stamp" 2>/dev/null || echo 0)"
+  [ "$now" -gt 0 ] && [ $(( now - last )) -lt 60 ] && return 0
 
-  ( bash "$s" >/dev/null 2>&1 & ) >/dev/null 2>&1
+  # 整个复合命令一起重定向，**不能**写成 `: > "$stamp" 2>/dev/null`：重定向按从
+  # 左到右生效，`> "$stamp"` 失败时报错是 shell 打在**还没被改掉**的 fd 2 上的，
+  # 后面那个 2>/dev/null 根本轮不到，`|| true` 也只吞退出码、不吞消息。
+  # 实测（2026-09-07）四种触发：只读 /tmp、别人拥有的 stamp、rc 里设了 noclobber、
+  # TMPDIR 指向已删目录——每一种都让用户**每开一个终端**看见一行红字。
+  { : > "$stamp"; } 2>/dev/null || true
+
+  # fail-soft ≠ fail-silent（脚本自己的注释里就写着这条）：全丢 /dev/null 的话，
+  # 「环境名连着好几天解析失败」这件事一点痕迹都不留。留一份小日志，超 20KB 清空。
+  # 落点先探可写再用，探不通就退回 /dev/null——用 `>>` 不用 `>`，既不截断、
+  # 也不会被 rc 里的 noclobber 拦；整段照样包在 { } 里，理由同上面那条。
+  local log="${TMPDIR:-/tmp}/.ona-window-title.log" sink="/dev/null"
+  if { : >> "$log"; } 2>/dev/null; then
+    sink="$log"
+    [ "$(wc -c < "$log" 2>/dev/null || echo 0)" -gt 20000 ] && { : > "$log"; } 2>/dev/null
+  fi
+
+  # --only-if-known：拿不到环境名时什么都不做。别用一次网络抖动把已经写对的标题
+  # 抹成退化版——这条路 detach 在后台，抹了当场没人会知道。
+  # （脚本里另有一道不依赖本参数的兜底：盘上已带 [名字] 就永不降级。）
+  ( bash "$s" --only-if-known >>"$sink" 2>&1 & ) >/dev/null 2>&1
 }
 _ona_window_title_heal
 

@@ -244,11 +244,15 @@ else
   warn "没有 $LIST，扩展装配未声明化（换环境要手装）"
 fi
 if [ -f "$DOT/vscode/set_window_title.sh" ]; then
-  if bash "$DOT/vscode/set_window_title.sh" --check >/dev/null 2>&1; then
-    ok "标题栏环境名：两侧 server 都是当前环境的名字"
-  else
-    bad "标题栏环境名没写全（某侧缺 / 名字过期）" "bash ~/dotfiles/vscode/set_window_title.sh"
-  fi
+  # 退出码有三档，别只分 0 / 非 0：3 是「没能检查」——拿不到环境名时它拒绝判断。
+  # 早先只分两档时，API 一抖动这里就会给出**反向**结论：已经退化的标题被判「已是
+  # 目标值」报绿（假绿），而正确的标题被判红（假红）。SKIP 不是 PASS，也不是 FAIL。
+  bash "$DOT/vscode/set_window_title.sh" --check >/dev/null 2>&1
+  case "$?" in
+    0) ok "标题栏环境名：两侧 server 都是当前环境的名字" ;;
+    3) warn "标题栏环境名：没能检查（拿不到环境名，多半是 ona API 暂时不通）" "稍后重跑 dotfiles-doctor" ;;
+    *) bad "标题栏环境名没写全（某侧缺 / 名字过期）" "bash ~/dotfiles/vscode/set_window_title.sh" ;;
+  esac
 fi
 
 # ── 6. 只能你自己在本地 VS Code 里确认的（容器内看不到）──────────────────
