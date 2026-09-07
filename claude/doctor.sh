@@ -35,9 +35,22 @@ if [ -d "$DOT/.git" ]; then
   else ok "工作区干净"; fi
   git -C "$DOT" fetch -q origin 2>/dev/null || true
   local_ahead="$(git -C "$DOT" rev-list --count origin/main..HEAD 2>/dev/null || echo 0)"
+  local_behind="$(git -C "$DOT" rev-list --count HEAD..origin/main 2>/dev/null || echo 0)"
   if [ "${local_ahead:-0}" != "0" ]; then
     bad "有 $local_ahead 个提交没 push——新环境拿不到" "dotfiles-sync"
-  else ok "已与远端同步"; fi
+  fi
+  # ── 落后这一侧此前完全没查，而它才是「长命环境越用越旧」的根因 ──────────────
+  # 只算 origin/main..HEAD（我改了没推）是**半个方向**。反方向（别处改了、这个容器
+  # 没拿到）从来没人查，于是 2026-09-07 实测：本环境落后 16 个版本、三个 hook 文件
+  # 躺在盘上从没生效过，而这一行当时报的正是「已与远端同步」——**假绿**。
+  # dotfiles 只在环境创建那一刻 clone + install，长命环境不会自己跟上。
+  if [ "${local_behind:-0}" != "0" ]; then
+    bad "落后远端 $local_behind 个版本——这个容器还在用旧设定，新功能不会自己长出来" \
+        "cd ~/dotfiles && git pull --ff-only && bash ~/dotfiles/install.sh"
+  fi
+  if [ "${local_ahead:-0}" = "0" ] && [ "${local_behind:-0}" = "0" ]; then
+    ok "与远端同步（两个方向都核过）"
+  fi
 else
   bad "$DOT 不存在或不是 git 仓库" "在 Ona 账户设置里配 dotfiles repo，或手动 clone 后跑 install.sh"
 fi
@@ -179,7 +192,7 @@ PY
 for h in $_hook_names; do
   p="$HOME/.claude/hooks/$h.py"
   if [ -e "$p" ]; then ok "hook 脚本在：$h.py"
-  else bad "hook 脚本缺失/断链：$h.py" "bash ~/dotfiles/install.sh"; fi
+  else bad "自动检查没接上：$h.py（文件在、但这个容器里没生效）" "bash ~/dotfiles/install.sh"; fi
 done
 
 # ── 3b. 免弹窗四层：不是「设过没有」，是「现在还全不全」────────────────────
@@ -192,7 +205,7 @@ done
 head_ "3b) 免弹窗四层（沙箱 / ask 名单 / 项目级）"
 _npg="$HOME/.claude/hooks/no-prompt-guard.py"
 if [ ! -e "$_npg" ]; then
-  bad "no-prompt-guard.py 缺失/断链——没有任何东西在守免弹窗配置了" "bash ~/dotfiles/install.sh"
+  bad "免弹窗配置现在没人守了（守卫脚本没接上）" "bash ~/dotfiles/install.sh"
 else
   _npg_out="$(python3 "$_npg" --check 2>&1)"; _npg_rc=$?
   printf '%s\n' "$_npg_out" | sed 's/^/  /'
@@ -219,7 +232,7 @@ if grep -q "_ona_claude_settings_heal" "$HOME/.bashrc" 2>/dev/null \
    || grep -q "ona-dotfiles aliases" "$HOME/.bashrc" 2>/dev/null; then
   ok "shell 自愈已挂进 ~/.bashrc（补丁失效时的第二层兜底）"
 else
-  bad "~/.bashrc 没挂 dotfiles aliases，自愈兜底不存在" "bash ~/dotfiles/install.sh"
+  bad "终端启动时不会加载你的通用设定（自动修复与提醒都不会跑）" "bash ~/dotfiles/install.sh"
 fi
 
 # ── 5. VS Code 扩展（两个 server 目录都要有）──────────────────────────────

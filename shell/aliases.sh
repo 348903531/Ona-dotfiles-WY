@@ -122,6 +122,35 @@ _ona_window_title_heal
 # 刚改完环境名、想立刻看到标题跟上：敲这条（不等 60 秒节流、也不用新开终端）
 alias fix-window-title='bash "$HOME/dotfiles/vscode/set_window_title.sh"'
 
+# --- 「设定没生效」自动提醒（2026-09-07 用户点名：只提醒不动手，但要提醒到位）---
+# 体检脚本一直都在、判据也对，但**要人主动敲命令才会跑**——真实后果是标题栏名字
+# 错了 12 天、三个功能装了没接上、设定仓库落后 16 个版本，而没有一次结论到达过
+# 用户眼前。用户原话：「像这次标题栏名字错了，你其实也没提醒我呀。」
+# **一个需要你先想起来去查的提醒，等于没有提醒。** 所以把结论推到每次开终端时。
+#
+# 用户同轮明确选了「只提醒不动手」：这里只显示 + 给一行修法，绝不自动装东西改配置。
+# 造价：显示是毫秒级（只 cat 一个文件）；真正的体检 1.3 秒，丢后台、每天最多一次。
+# 关掉它：export ONA_ENV_HEALTH_NOTICE=off
+_ona_env_health_notice() {
+  [ "${ONA_ENV_HEALTH_NOTICE:-on}" = "off" ] && return 0
+  local s="$HOME/dotfiles/shell/env_health_notice.sh"
+  [ -f "$s" ] || return 0
+
+  bash "$s"                                    # 显示上一次的结论，毫秒级
+
+  local stamp="${TMPDIR:-/tmp}/.ona-env-health.stamp"
+  local now last
+  now="$(date +%s 2>/dev/null || echo 0)"
+  last="$(stat -c %Y "$stamp" 2>/dev/null || echo 0)"
+  [ "$now" -gt 0 ] && [ $(( now - last )) -lt 86400 ] && return 0
+  { : > "$stamp"; } 2>/dev/null || true        # { } 包起来的理由同上面那条
+  ( bash "$s" --refresh >/dev/null 2>&1 & ) >/dev/null 2>&1
+}
+_ona_env_health_notice
+
+# 一键修：把设定拉到最新 + 重新装一遍（幂等）。子 shell 里 cd，不改你当前目录。
+alias dotfiles-fix='( cd "$HOME/dotfiles" && git pull --ff-only ) && bash "$HOME/dotfiles/install.sh"'
+
 # 一键体检：装过 ≠ 现在还活着（见 claude/doctor.sh）
 alias dotfiles-doctor='bash "$HOME/dotfiles/claude/doctor.sh"'
 

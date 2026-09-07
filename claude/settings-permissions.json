@@ -37,6 +37,17 @@
         ],
         "description": "Memory index budget guard (user-level): 盯住 MEMORY.md 索引的体量，别让它无声涨下去。文件式 memory 是两层加载——索引每次会话【全量注入】、正文只在判断相关时才单独 Read，所以常驻成本只有索引，而索引只增不减、此前没有任何东西在量它。实测（2026-08-29，WY-workspace-P）115 条 memory / 索引 15,029 codepoints ≈ 1.4 万 token 每轮常驻；按此外推 1000 条 ≈ 13 万 token，其中绝大多数与当天任务无关，「加了也白加」就从个例变成常态。同族参照 lessons-index：159 条、预算 9000 字符，实测只进 45 条、报文自己写着「有 35 条无兜底教训也没塞进来」——那 35 条就是白加真实发生的样子。⚠️ 口径必须数 codepoints 不是字节（中文 1 字 3 字节，同一文件 27,095 bytes vs 15,029 cp，混用虚高约 2 倍；作者第一次口述这个数就踩了）。阈值 20,000 刻意高于当前值，保证挂上去当天是绿的——闸门一挂就恒红，人会立刻学会忽略它（本仓已有「恒定假红的测试会拦死整个 skill」这条教训）。刹车的意义不是现在停车，是别让它无声地涨。只报告不阻断（SessionStart 硬拦会卡死启动），判不了「哪条该删」（语义判断）。自测 13/13 含 5 条阴性对照 + 2 条中文口径防回归；真库判别力已双向验过（当前阈值绿、压到 10000 真红并点名到行）。逃生阀 MEMORY_INDEX_BUDGET_GUARD_SKIP=1；项目级同名 hook 存在时静默让位。",
         "id": "sessionstart:memory-index-budget-guard"
+      },
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "GUARD=\"$HOME/.claude/hooks/env-health-notice.py\"; [ -f \"$GUARD\" ] && python3 \"$GUARD\" || exit 0"
+          }
+        ],
+        "description": "Env health notice (user-level): 会话一开始就把「你的通用设定在这个容器里没生效」送到 agent 眼前，由 agent 用人话主动告诉用户。2026-09-07 用户点名——体检脚本 dotfiles-doctor 一直都在、判据也对，但**要人主动敲命令才会跑**，真实后果是 VS Code 标题栏环境名错了 12 天、三个 hook 装了没接上、dotfiles 落后 16 个版本，体检天天查得出来而没有一次结论到达过用户眼前。用户原话「像这次标题栏名字错了，你其实也没提醒我呀」。**一个需要你先想起来去查的提醒，等于没有提醒。** 用户同轮明确选了「只提醒不动手」，所以本 hook 只注入结论 + 指示 agent 报告，绝不自动修。两层触达：shell/aliases.sh 那层给用户直接看（每开新终端），本层补「用户一直用同一个终端、不开新的」那个缺口。刻意**不自己跑体检**（要 1.3 秒含一次 git fetch，会拖慢会话启动），只读 shell/env_health_notice.sh 后台每天写一次的结论文件，毫秒级；代价是结论可能是一天内的旧值，对「设定过期」这种以天为尺度的漂移完全够用。全绿时结论文件被清空 → 本 hook 零输出、完全不打扰。fail-open 绝不卡启动，逃生阀 ONA_ENV_HEALTH_NOTICE=off，自检 7/7（含 2 条阴性对照 + 颜色码剥离 + 逃生阀）。",
+        "id": "sessionstart:env-health-notice"
       }
     ],
     "UserPromptSubmit": [
