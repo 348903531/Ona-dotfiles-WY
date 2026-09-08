@@ -182,6 +182,26 @@ def _index_rows(text: str) -> list[str]:
     return [ln for ln in text.splitlines() if ln.strip().startswith("- [")]
 
 
+def _ranks_by_relevance(loader) -> bool:
+    """loader 超预算时是「按相关性挑」还是「按文件顺序截」？决定本条判罚的档次。
+
+    两种截断的伤害不是一个量级，所以刻意分档（2026-09-08 定）：
+
+    · **位置截断**（老 loader）——排在后面的**必定**被丢。而 memory 是往文件尾部追加的，
+      于是「刚写下的教训永远加载不进来」，写一条死一条。这是**硬失败**，判 ❌。
+    · **相关性排序**（`_pick_rows`，commit 8fdebdc 起）——每条都有机会进，
+      让位的是与本次提问最不沾边的那几条。这是**优雅降级**，判 ⚠️。
+
+    ⚠️ 这不是为了把体检刷绿（卡 #18b：闸门是指标不是目的）。判据本身没放松——
+    超预算照报、照点名、修法照给；变的只是**它该不该让整份体检红着**。
+    一盏永远红着的灯，最后的下场是没人看它——本仓这轮正在治的就是这个病。
+
+    判据取「loader 有没有 `_pick_rows`」这个**行为特征**，不是版本号也不是日期：
+    谁哪天把 loader 改回位置截断，这里自动升回 ❌，不需要有人记得同步。
+    """
+    return callable(getattr(loader, "_pick_rows", None))
+
+
 def _would_drop(rows: list[str], budget: int, loader=None) -> list[str]:
     """算出**哪几条注不进来**。优先调 loader 自己的挑选函数，不自己复刻。
 
@@ -464,7 +484,9 @@ def run_hook() -> int:
             msgs.append("【memory 分域腐化】\n" + "\n".join(f"· {r}" for r in rot))
         over = check_domain_budgets(idx.parent)
         if over:
-            msgs.append("【分域索引超预算：最新那几条注不进来】\n"
+            # 标题别写死「最新那几条」——loader 2026-09-08 起按相关性挑，
+            # 被丢的是「与本次提问最不沾边的」，不再是「最新的」。
+            msgs.append("【分域索引超预算：有几条注不进来】\n"
                         + "\n".join(f"· {r}" for r in over))
         if not msgs:
             return 0                      # 都没问题 → 静默
@@ -515,10 +537,19 @@ def run_check(cwd: Path | None = None) -> int:
         else:
             over = check_domain_budgets(mem_dir)
             if over:
-                print(f"\n🔴 分域索引超预算（loader MAX_DOMAIN_CP={loader.MAX_DOMAIN_CP:,}）：")
+                graceful = _ranks_by_relevance(loader)
+                mark = "⚠️ " if graceful else "🔴"
+                print(f"\n{mark} 分域索引超预算"
+                      f"（loader MAX_DOMAIN_CP={loader.MAX_DOMAIN_CP:,}）：")
                 for r in over:
                     print(f"  · {r}")
-                rc = 1
+                if graceful:
+                    # 优雅降级：每条都有机会进，让位的是与提问最不沾边的。
+                    # 报但不判红——理由见 _ranks_by_relevance 的 docstring。
+                    print("  （loader 按相关性挑，属优雅降级，不判红；"
+                          "要彻底消掉就压缩索引行或拆域）")
+                else:
+                    rc = 1
             else:
                 print(f"✅ OK  每域索引都在 loader 预算内"
                       f"（MAX_DOMAIN_CP={loader.MAX_DOMAIN_CP:,}，无条目被截断）")
@@ -737,7 +768,13 @@ def _selftest() -> int:
             (bdir / "_index_ppt.md").write_text("- [t](t.md) — 短\n", encoding="utf-8")
             check("阴性·压回预算内后完全静默", check_domain_budgets(bdir), [])
 
-            # run_check 退出码：每域超预算也要真的 exit 1
+            # ── run_check 退出码：超预算分两档，两档都要真验一次 ──────────
+            #
+            # 2026-09-08 改：本条原本是「超预算 → 恒 exit 1」的单锚。
+            # loader 改成按相关性挑之后，伤害从「新写的必定死」变成「优雅让位」，
+            # 判罚随之分档（见 _ranks_by_relevance）。**只验降级那档等于把测试
+            # 改成配合实现**——所以这里刻意造一个没有 `_pick_rows` 的假 loader，
+            # 验❌那档还在。谁哪天把 loader 改回位置截断，这条锚会立刻发现。
             pj = tmp / "workspaces" / "bproj"
             (pj / ".claude").mkdir(parents=True)
             import shutil
@@ -747,7 +784,25 @@ def _selftest() -> int:
                 encoding="utf-8")
             (pj / ".claude" / "memory" / "a.md").write_text(
                 "---\nmetadata:\n  domain: always\n---\nx\n", encoding="utf-8")
-            check("run_check(每域超预算)→1", run_check(pj), 1)
+
+            # 档一·相关性排序（真 loader，有 _pick_rows）→ 报但不判红
+            real = _load_loader()
+            check("真 loader 具备 _pick_rows（本档的前提）",
+                  real is not None and _ranks_by_relevance(real), True)
+            check("run_check(超预算·相关性排序)→0", run_check(pj), 0)
+
+            # 档二·位置截断（假 loader，摘掉 _pick_rows）→ 必须真的 exit 1
+            class _PositionalLoader:
+                MAX_DOMAIN_CP = real.MAX_DOMAIN_CP if real else 4000
+                # 刻意不提供 _pick_rows —— 模拟旧 loader
+            check("假 loader 被判为位置截断",
+                  _ranks_by_relevance(_PositionalLoader()), False)
+            _orig_load = globals()["_load_loader"]
+            globals()["_load_loader"] = lambda *a, **k: _PositionalLoader()
+            try:
+                check("run_check(超预算·位置截断)→1", run_check(pj), 1)
+            finally:
+                globals()["_load_loader"] = _orig_load
 
         # ── 项目级同名 hook 存在 → 让位 ─────────────────────────────
         (proj / ".claude" / "hooks").mkdir(parents=True)
