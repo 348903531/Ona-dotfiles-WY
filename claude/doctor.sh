@@ -14,7 +14,9 @@
 
 set -uo pipefail
 
-DOT="$HOME/dotfiles"
+# DOTFILES_DIR 只为**可测**而存在：这套判据没法拿真仓库验（真仓库不能说脏就脏），
+# 而验不了的判据 = 报的绿不作数。日常永远走默认值。
+DOT="${DOTFILES_DIR:-$HOME/dotfiles}"
 FAILS=0; WARNS=0
 G=$'\033[32m'; R=$'\033[31m'; Y=$'\033[33m'; D=$'\033[2m'; N=$'\033[0m'
 
@@ -29,9 +31,46 @@ printf '\n跨项目设置体检（层④ = 换项目、换容器都还在）\n'
 head_ "1) dotfiles 仓库"
 if [ -d "$DOT/.git" ]; then
   ok "已 clone 到 $DOT"
-  if [ -n "$(git -C "$DOT" status --porcelain 2>/dev/null)" ]; then
-    warn "有未提交改动——改了不 commit+push，新环境 clone 不到 = 白改" \
-         "dotfiles-sync \"说明这次改了什么\""
+  # ── 「正在写」和「忘了提交」是两回事，只有后者该吵醒人 ──────────────────────
+  # 原来这条一律 warn。而 env_health_notice **只摘 ❌ 不摘 ⚠️**（它那边的理由是对的：
+  # 编辑期间工作区天天是脏的，全报 = 天天满屏 = 人开始无视）。于是「改了忘了提交」
+  # 这件事**在任何自动通道里都不会响**——2026-09-08 实测：一个 hook 改动躺在工作区
+  # 未提交，doctor 只 ⚠️、自动提醒一个字不说，直到人肉发现。而 dotfiles 没提交 =
+  # 容器一删就没了，正是这套体检存在的理由。
+  #
+  # 判据用**改动有多久没动过**分这两种情况，不用「脏不脏」：
+  #   刚改过（< 阈值）→ 你正在写，warn 就够，别打扰
+  #   很久没动（≥ 阈值）→ 不是在写，是忘了，升 ❌ 走自动提醒
+  # 取所有改动文件里**最新**的那个 mtime：只要还有一个文件是刚碰过的，就算在写。
+  dirty="$(git -C "$DOT" status --porcelain -uall 2>/dev/null)"   # -uall：未跟踪目录会被折叠成一行，逐文件才 stat 得到
+  if [ -n "$dirty" ]; then
+    stale_days="${DOTFILES_STALE_DAYS:-2}"
+    newest=0
+    while IFS= read -r line; do
+      [ -n "$line" ] || continue
+      p="${line:3}"
+      case "$p" in *" -> "*) p="${p##* -> }" ;; esac      # 重命名取箭头右边
+      p="${p%\"}"; p="${p#\"}"                            # 含空格/中文时 git 会加引号
+      [ -e "$DOT/$p" ] || continue                        # 纯删除：文件没了，stat 不到
+      m="$(stat -c %Y "$DOT/$p" 2>/dev/null || echo 0)"
+      [ "${m:-0}" -gt "$newest" ] 2>/dev/null && newest="$m"
+    done <<EOF
+$dirty
+EOF
+    if [ "${newest:-0}" -eq 0 ] 2>/dev/null; then
+      # stat 不到（只有删除 / 平台没有 stat -c）→ 拿不准就别升级，退回原行为
+      warn "有未提交改动——改了不 commit+push，新环境 clone 不到 = 白改" \
+           "dotfiles-sync \"说明这次改了什么\""
+    else
+      age_days=$(( ( $(date +%s) - newest ) / 86400 ))
+      if [ "$age_days" -ge "$stale_days" ] 2>/dev/null; then
+        bad "有未提交改动、且最后一次改动是 $age_days 天前——这不是正在写，是忘了提交；容器一删就没了" \
+            "dotfiles-sync \"说明这次改了什么\""
+      else
+        warn "有未提交改动（$age_days 天内还在动，当作你正在写）" \
+             "写完记得 dotfiles-sync \"说明这次改了什么\"，否则新环境 clone 不到"
+      fi
+    fi
   else ok "工作区干净"; fi
   git -C "$DOT" fetch -q origin 2>/dev/null || true
   local_ahead="$(git -C "$DOT" rev-list --count origin/main..HEAD 2>/dev/null || echo 0)"
