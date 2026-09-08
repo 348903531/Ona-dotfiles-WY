@@ -57,6 +57,32 @@ r"""memory-index-budget-guard — memory 索引涨到什么程度了？没有刹
 - 数的是 codepoints，与真实 token 数不完全相等（中文≈1:1，英文≈1:0.3），
   作为**趋势指标**足够，不当精确账单用。
 
+第二个预算：每个分域子索引对 loader 的 MAX_DOMAIN_CP（2026-09-08 补）
+--------------------------------------------------------------------
+上面那个预算只管**常驻的 MEMORY.md**。分域之后冒出第二个预算，而它一直没人查：
+`memory-domain-loader` 注入某个域时，若该域索引行的总长超过 `MAX_DOMAIN_CP`，
+就**从尾部截断**并附一句「…还有 N 条没列」。**而新教训一律追加在索引末尾**——
+于是「最新写的那几条，生下来就注不进上下文」。写了、进了 git、索引也有，
+就是永远不会在做那类活时出现在眼前。
+
+2026-09-08 本机实测（WY-workspace-P，喂真实 prompt 给 loader 数注入条数）：
+
+    _index_ppt.md         34 条 → 只注入 30 条，尾部 4 条被丢
+                                   （含当天刚 commit 的「做 PPT 前先查引擎装没装」）
+    _index_gatecraft.md   40 条 → 只注入 28 条，丢 12 条
+    _index_medical.md     31 条 → 只注入 28 条，丢 3 条
+
+**这道自查此前报的是假绿**：MEMORY.md 3,320 cp 远低于 20,000，`--check` 一路 ✅，
+而三个域每天都在丢条目。缺的不是阈值，是**根本没查这一层**。
+
+⚠️ 阈值**从 loader 源码 import**，绝不在这里抄一份 4000——同一个常数两份必漂移
+（本仓已有一条教训记的正是这个）。loader 找不到时整道检查静默让位，
+**刻意不设兜底默认值**：没有权威阈值时报绿报红都是编的。
+
+⚠️ 超了之后**别直接调大 `MAX_DOMAIN_CP`**：它跨所有项目生效，调大 = 给每个项目
+每一轮都加上下文，属**取舍不属 bug 修复**，该由用户定。先做便宜的：压索引行、
+或把过大的域拆成两个。
+
 用法
 ----
   SessionStart hook：读 stdin JSON，超阈值则注入 additionalContext，永远 exit 0
@@ -108,7 +134,120 @@ def slug_for(cwd: Path) -> str:
 
 def index_path_for(cwd: Path, home: Path | None = None) -> Path:
     home = home or Path.home()
-    return home / ".claude" / "projects" / slug_for(cwd) / "memory" / "MEMORY.md"
+    slug_path = home / ".claude" / "projects" / slug_for(cwd) / "memory" / "MEMORY.md"
+    if slug_path.exists():
+        return slug_path
+    # 兜底：projects 目录是按 cwd 的**全路径**映射的，所以在 git worktree 里
+    # （cwd = /tmp/wt-xxx）永远映射不到任何东西，整道自查静默 SKIP——而 worktree
+    # 恰恰是改 memory 最常用的地方。回落到仓库内的 .claude/memory/。
+    # 只在 slug 路径不存在时才用，不改变主工作区的既有行为。
+    local = cwd / ".claude" / "memory" / "MEMORY.md"
+    if local.exists():
+        return local
+    return slug_path
+
+
+# ── 第二个预算：每个分域子索引 vs loader 的 MAX_DOMAIN_CP ──────────────────
+# 阈值只有一个权威来源：memory-domain-loader.py 自己。这里**只 import、不抄**。
+LOADER_NAMES = ("memory-domain-loader.py",)
+
+
+def _load_loader():
+    """把同目录（或 ~/.claude/hooks/）的 loader 当模块加载，只为拿它的常量。
+
+    文件名带连字符，`import` 语法用不了，故走 importlib 按路径加载。
+    加载失败 → 返回 None，本节检查整体让位（**不设默认阈值**：
+    没有权威值时，报绿报红都是编的）。
+    """
+    import importlib.util
+
+    here = Path(__file__).resolve().parent
+    for cand in [here / n for n in LOADER_NAMES] + \
+                [Path.home() / ".claude" / "hooks" / n for n in LOADER_NAMES]:
+        if not cand.is_file():
+            continue
+        try:
+            spec = importlib.util.spec_from_file_location("_mem_domain_loader", cand)
+            mod = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(mod)          # 顶层只有常量与函数定义
+            if isinstance(getattr(mod, "MAX_DOMAIN_CP", None), int):
+                return mod
+        except Exception:
+            continue
+    return None
+
+
+def _index_rows(text: str) -> list[str]:
+    """与 loader.build_block 逐字相同的取行方式（改一处要同步改另一处）。"""
+    return [ln for ln in text.splitlines() if ln.strip().startswith("- [")]
+
+
+def _would_drop(rows: list[str], budget: int) -> list[str]:
+    """复刻 loader.build_block 的截断循环，算出**哪几条注不进来**。
+
+    注意它按 len(row) 累加、**不算换行符**——照抄，别"顺手修正"，
+    否则这里报的条数和实际被丢的条数对不上，比不报还糟。
+    """
+    keep: list[str] = []
+    dropped: list[str] = []
+    for r in rows:
+        if sum(len(x) for x in keep) + len(r) > budget:
+            dropped.append(r)
+        else:
+            keep.append(r)
+    return dropped
+
+
+def check_domain_budgets(mem_dir: Path) -> list[str]:
+    """每个 `_index_<域>.md` 会不会被 loader 截掉尾巴。没启用分域 → 完全静默。"""
+    conf = mem_dir / "domains.json"
+    if not conf.is_file():
+        return []
+    loader = _load_loader()
+    if loader is None:
+        return []                        # 拿不到权威阈值 → 让位，不编一个
+    budget = loader.MAX_DOMAIN_CP
+
+    try:
+        doms = json.loads(conf.read_text(encoding="utf-8")).get("domains", [])
+    except Exception:
+        return []
+
+    problems = []
+    for d in doms:
+        if d.get("resident"):
+            continue                     # 常驻域走 MEMORY.md 那条预算，不在这
+        did = d.get("id")
+        f = mem_dir / f"_index_{did}.md"
+        try:
+            rows = _index_rows(f.read_text(encoding="utf-8"))
+        except OSError:
+            continue
+        total = sum(len(r) for r in rows)
+        if total <= budget:
+            continue
+        dropped = _would_drop(rows, budget)
+        names = []
+        for r in dropped[:3]:
+            m = re.search(r"^-\s*\[([^\]]+)\]", r.strip())
+            names.append(m.group(1) if m else r.strip()[:24])
+        problems.append(
+            f"**DOMAIN_INDEX_OVER_BUDGET · `{did}`**："
+            f"_index_{did}.md 共 {len(rows)} 条 / {total:,} cp，"
+            f"超 loader 的 MAX_DOMAIN_CP={budget:,}，"
+            f"做这类任务时**最后 {len(dropped)} 条注不进上下文**"
+            + ("（" + "、".join(names) + ("…" if len(dropped) > 3 else "") + "）" if names else "")
+        )
+
+    if problems:
+        problems.append(
+            "→ loader 是**从尾部截断**的，而新教训一律追加在末尾——"
+            "所以被丢的永远是最新写的那几条。"
+            "先做便宜的：压缩该域最长的几行索引（索引行只是「什么情况下你需要我」，"
+            "不是摘要正文），或把过大的域拆成两个。"
+            "**别直接调大 MAX_DOMAIN_CP**——它跨所有项目生效，属取舍、该用户定。"
+        )
+    return problems
 
 
 def measure(idx: Path) -> dict | None:
@@ -159,8 +298,14 @@ def check_partitioning(mem_dir: Path) -> list[str]:
     except Exception:
         return []
 
+    # 2026-09-08 修一个**先于本次改动就存在**的假红：排除表里只有 `_README`，
+    # 于是普通的 `README.md`（说明文档，不是 memory 条目）被当成 fact，
+    # 恒报「缺 domain + 不在任何索引里」——本脚本自己的 selftest 里那条
+    # 「阴性·README 与 _index_ 不当 fact」一直是红的（20 过 1 红）。
+    # 恒定假红的测试最后的下场是被整体忽略，所以顺手修掉。
     facts = [p for p in mem_dir.glob("*.md")
-             if p.stem not in ("MEMORY", "_README") and not p.stem.startswith("_index_")]
+             if p.stem not in ("MEMORY", "_README", "README")
+             and not p.stem.startswith("_index_")]
 
     dom_of: dict[str, str | None] = {}
     for p in facts:
@@ -297,6 +442,10 @@ def run_hook() -> int:
         rot = check_partitioning(idx.parent)
         if rot:
             msgs.append("【memory 分域腐化】\n" + "\n".join(f"· {r}" for r in rot))
+        over = check_domain_budgets(idx.parent)
+        if over:
+            msgs.append("【分域索引超预算：最新那几条注不进来】\n"
+                        + "\n".join(f"· {r}" for r in over))
         if not msgs:
             return 0                      # 都没问题 → 静默
         print(json.dumps({
@@ -327,14 +476,32 @@ def run_check(cwd: Path | None = None) -> int:
         print()
         print(build_message(m))
         rc = 1
-    rot = check_partitioning(index_path_for(cwd).parent)
+    mem_dir = index_path_for(cwd).parent
+    rot = check_partitioning(mem_dir)
     if rot:
         print("\n🔴 分域腐化：")
         for r in rot:
             print(f"  · {r}")
         rc = 1
-    elif (index_path_for(cwd).parent / "domains.json").is_file():
+    elif (mem_dir / "domains.json").is_file():
         print("✅ OK  分域完整（每条都有合法 domain、都在索引里、常驻区只有 always）")
+
+    # ── 第二个预算：每个分域子索引 vs loader 的 MAX_DOMAIN_CP ──────────
+    if (mem_dir / "domains.json").is_file():
+        loader = _load_loader()
+        if loader is None:
+            print("⏭️  SKIP  每域预算：找不到 memory-domain-loader.py，"
+                  "拿不到权威阈值（刻意不在本脚本里抄一份——两份必漂移）")
+        else:
+            over = check_domain_budgets(mem_dir)
+            if over:
+                print(f"\n🔴 分域索引超预算（loader MAX_DOMAIN_CP={loader.MAX_DOMAIN_CP:,}）：")
+                for r in over:
+                    print(f"  · {r}")
+                rc = 1
+            else:
+                print(f"✅ OK  每域索引都在 loader 预算内"
+                      f"（MAX_DOMAIN_CP={loader.MAX_DOMAIN_CP:,}，无条目被截断）")
     return rc
 
 
@@ -456,6 +623,82 @@ def _selftest() -> int:
             "---\nmetadata:\n  type: feedback\n  domain: git\n---\nx\n", encoding="utf-8")
         check("阴性·README 与 _index_ 不当 fact", check_partitioning(pdir), [])
 
+        # ── 每域预算（2026-09-08 新增）──────────────────────────────
+        loader = _load_loader()
+        check("能从 loader 拿到权威阈值（拿不到就整节让位）", loader is not None, True)
+        if loader is not None:
+            MAXD = loader.MAX_DOMAIN_CP
+            check("阈值确实是 int 且 >0", MAXD > 0, True)
+
+            bdir = tmp / "bmem"
+            bdir.mkdir()
+            (bdir / "MEMORY.md").write_text("- [a](a.md) — x\n", encoding="utf-8")
+
+            # 阴性对照①：没有 domains.json 一律静默（没启用分域的项目天天报＝没人看）
+            (bdir / "_index_ppt.md").write_text(
+                "".join(f"- [t{i}](t{i}.md) — " + "长" * 200 + "\n" for i in range(30)),
+                encoding="utf-8")
+            check("阴性·无 domains.json 时不查每域预算", check_domain_budgets(bdir), [])
+
+            (bdir / "domains.json").write_text(json.dumps({"domains": [
+                {"id": "always", "resident": True}, {"id": "ppt"}, {"id": "git"},
+            ]}), encoding="utf-8")
+
+            # 阳性：30 × ~210 cp 远超预算 → 必红，且报文要带标识串与域名
+            r = check_domain_budgets(bdir)
+            check("阳性·超预算被抓到", bool(r), True)
+            check("阳性·报文带标识串 DOMAIN_INDEX_OVER_BUDGET",
+                  any("DOMAIN_INDEX_OVER_BUDGET" in x for x in r), True)
+            check("阳性·点名到域", any("`ppt`" in x for x in r), True)
+
+            # 报的「丢几条」必须与 loader 真实丢的条数一致——这才是本节的判别力。
+            # 拿 loader 自己的 build_block 出来的**产物**反查，而不是信我这边的算术。
+            #
+            # ⚠️ 判据刻意数「真被注入了几行」，不去 regex 那句截断提示的措辞
+            # （2026-09-08 踩到：提示语从「还有 N 条没列」改成「另 N 条这次没列」，
+            # 我这边 regex 立刻 got=None、整条锚静默失效）。措辞是会变的，
+            # 「注进去了几行」是行为、不会变——**对着行为写判据，别对着话术写**。
+            rows = _index_rows((bdir / "_index_ppt.md").read_text(encoding="utf-8"))
+            mine = len(_would_drop(rows, MAXD))
+            doms_l = [{"id": "ppt", "label": "x", "keywords": ["ppt"]}]
+            # loader 读的是 <cwd>/.claude/memory/，造一份同内容的给它
+            lm = tmp / "lproj" / ".claude" / "memory"
+            lm.mkdir(parents=True)
+            (lm / "_index_ppt.md").write_text(
+                (bdir / "_index_ppt.md").read_text(encoding="utf-8"), encoding="utf-8")
+            blk = loader.build_block(tmp / "lproj", ["ppt"], doms_l) or ""
+            listed = len(_index_rows(blk))
+            check("丢的条数与 loader 实际截断一致", len(rows) - listed == mine, True)
+
+            # 阴性对照②：正好卡在预算上不报（边界是 > 不是 >=）
+            (bdir / "_index_git.md").write_text("- [x](x.md) — " + "长" * (MAXD - 14) + "\n",
+                                                encoding="utf-8")
+            check("阴性·git 域正好等于预算不报",
+                  any("`git`" in x for x in check_domain_budgets(bdir)), False)
+
+            # 阴性对照③：resident 域不参与（它走 MEMORY.md 那条预算）
+            (bdir / "_index_always.md").write_text(
+                "".join(f"- [a{i}](a{i}.md) — " + "长" * 200 + "\n" for i in range(30)),
+                encoding="utf-8")
+            check("阴性·resident 域不参与每域预算",
+                  any("`always`" in x for x in check_domain_budgets(bdir)), False)
+
+            # 阴性对照④：把超长的那个域压回预算内 → 完全静默（判别力：能分开好坏）
+            (bdir / "_index_ppt.md").write_text("- [t](t.md) — 短\n", encoding="utf-8")
+            check("阴性·压回预算内后完全静默", check_domain_budgets(bdir), [])
+
+            # run_check 退出码：每域超预算也要真的 exit 1
+            pj = tmp / "workspaces" / "bproj"
+            (pj / ".claude").mkdir(parents=True)
+            import shutil
+            shutil.copytree(bdir, pj / ".claude" / "memory")
+            (pj / ".claude" / "memory" / "_index_ppt.md").write_text(
+                "".join(f"- [t{i}](t{i}.md) — " + "长" * 200 + "\n" for i in range(30)),
+                encoding="utf-8")
+            (pj / ".claude" / "memory" / "a.md").write_text(
+                "---\nmetadata:\n  domain: always\n---\nx\n", encoding="utf-8")
+            check("run_check(每域超预算)→1", run_check(pj), 1)
+
         # ── 项目级同名 hook 存在 → 让位 ─────────────────────────────
         (proj / ".claude" / "hooks").mkdir(parents=True)
         (proj / ".claude" / "hooks" / "memory-index-budget-guard.py").write_text("#", encoding="utf-8")
@@ -468,7 +711,8 @@ def _selftest() -> int:
     if failed:
         print(f"\n❌ selftest 失败 {len(failed)}/{len(passed) + len(failed)}")
         return 1
-    print(f"\n✅ selftest 全过（{len(passed)} 项，含 5 条阴性对照 + 2 条口径防回归）")
+    print(f"\n✅ selftest 全过（{len(passed)} 项，含 9 条阴性对照 + 2 条口径防回归"
+          f" + 1 条「报的条数与 loader 实际截断一致」判别力锚）")
     return 0
 
 
