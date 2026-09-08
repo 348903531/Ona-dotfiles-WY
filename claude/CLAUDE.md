@@ -743,6 +743,18 @@ A'Hern写。用户下一轮：「**这个我不是说了吗？用Simon两阶段�
 - **别信 `gh pr view` 的缓存，回到实物**:`git ls-remote origin <分支>` 看远端真实sha、
   `gh api .../pulls/<n> --jq .head.sha` 看PR真实head。两者对不上就是出事了。
 - 未经明确要求**不主动commit / push**。
+- **写之前先分清这个仓库是谁的**(2026-09-07用户点名)。用户原话：
+  「不能对别人的仓库进行推送和修改，保证不要影响人家的仓库……我自己的仓库就可以做修改，
+  可以影响，别人的仓库就不要提PR，不要做任何事情。」
+  **判据不是「是不是PR」,是「这个仓库归谁」**——我一开始把他的话理解成「别开PR」,
+  把他自己仓库里那个PR也关掉了，实际他要拦的是**动到别人的仓库**。
+  - **他自己的**(个人账号 `wangy548_roche/*`、他的fork、他的dotfiles) → 可提交、可推、可开PR。
+  - **别人的 / 组织的**(`roche-innersource/*` 这类上游) → **一律不动**:不推分支、不开PR、
+    不改设置。要贡献先说清楚、由他决定。
+  **动手前一条命令看清楚**:`git remote -v`。同一个检出里 `origin` 常常是**他的fork**、
+  `upstream` 才是别人的上游——只看仓库名会认错(2026-09-07实测：`origin` =
+  `wangy548_roche/silicon-hitchhiker`,`upstream` = `roche-innersource/silicon-hitchhiker`)。
+  **平台的403不算护栏**:那次组织的令牌策略恰好把写操作全挡了，属侥幸；判断要在动手前做完。
 - commit时加co-author:`Co-authored-by: Ona <no-reply@ona.com>`。
 
 ## 安全红线
