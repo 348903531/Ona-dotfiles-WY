@@ -696,12 +696,24 @@ def _selftest() -> int:
             # 而报文里「最后 N 条」「从尾部截断」已经全错了）。补两条：
             #   ① 非零信号下条数仍要对得上；② 丢的**是哪几条**也要对得上。
             # 这才叫「对着行为写判据」——只对条数、不对集合，同样会漏。
-            probe = "ppt 幻灯 t29 t28"
-            blk_p = loader.build_block(tmp / "lproj", ["ppt"], doms_l, probe) or ""
-            check("丢的条数在**非零信号**下也与 loader 一致",
-                  len(rows) - len(_index_rows(blk_p)) == mine, True)
+            # ⚠️ 这两条只在 loader 支持 prompt 时才有意义。**必须先探签名**——
+            #    直接传 4 个位置参数，撞上老 loader 会 TypeError 整个 selftest 崩掉，
+            #    而本文件对老 loader 的契约是「优雅让位」，不是「炸」。
+            #    （2026-09-08 真踩：/tmp 里躺着一份旧 loader，从 /tmp 跑本脚本时
+            #     被 _load_loader 优先捡到，selftest 当场 TypeError。运行时那条路
+            #     有 try/except 兜住、报的条数仍对，只有这里裸调会炸。）
+            import inspect as _insp
+            try:
+                _has_prompt = "prompt" in _insp.signature(loader.build_block).parameters
+            except (TypeError, ValueError):
+                _has_prompt = False
+            if _has_prompt:
+                probe = "ppt 幻灯 t29 t28"
+                blk_p = loader.build_block(tmp / "lproj", ["ppt"], doms_l, probe) or ""
+                check("丢的条数在**非零信号**下也与 loader 一致",
+                      len(rows) - len(_index_rows(blk_p)) == mine, True)
             kept0 = set(_index_rows(loader.build_block(
-                tmp / "lproj", ["ppt"], doms_l, "") or ""))
+                tmp / "lproj", ["ppt"], doms_l) or ""))
             check("丢的**是哪几条**与 loader 零信号逐条一致",
                   set(_would_drop(rows, MAXD, loader)) == set(rows) - kept0, True)
             check("报文不再说死「最后 N 条」/「从尾部截断」",
