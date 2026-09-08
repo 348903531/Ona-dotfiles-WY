@@ -182,19 +182,37 @@ def _index_rows(text: str) -> list[str]:
     return [ln for ln in text.splitlines() if ln.strip().startswith("- [")]
 
 
-def _would_drop(rows: list[str], budget: int) -> list[str]:
-    """复刻 loader.build_block 的截断循环，算出**哪几条注不进来**。
+def _would_drop(rows: list[str], budget: int, loader=None) -> list[str]:
+    """算出**哪几条注不进来**。优先调 loader 自己的挑选函数，不自己复刻。
 
-    注意它按 len(row) 累加、**不算换行符**——照抄，别"顺手修正"，
-    否则这里报的条数和实际被丢的条数对不上，比不报还糟。
+    ⚠️ 2026-09-08 第二次改：初版把 loader 的截断循环**抄了一份**在这里，
+    注释还写着「改一处要同步改另一处」——那句话本身就是缺陷的自白。
+    同一天 loader 就改成了「按与本次 prompt 的相关性挑」（commit 8fdebdc），
+    这份抄件立刻过期：条数在零信号下碰巧还对，但**被丢的是哪几条完全错了**
+    （实测 gatecraft 域：抄件说丢的 5 条里有 4 条其实被保留了）。
+    所以现在只 import 不抄——与本文件对 MAX_DOMAIN_CP 的处理同一条原则。
+
+    口径：本 hook 在 SessionStart / --check 时跑，**手上没有 prompt**，
+    故一律按零信号（terms={}）算。loader 在零信号时按原顺序稳定排序，
+    于是「丢几条」是确定的；「丢哪几条」则取决于当次提问，报文里不许说死。
     """
+    pick = getattr(loader, "_pick_rows", None)
+    if callable(pick):
+        try:
+            kept = set(pick(rows, {}, budget))
+            return [r for i, r in enumerate(rows) if i not in kept]
+        except Exception:
+            pass                          # 签名变了 → 退回下面的保守算法
+    # 兜底：老 loader（或 _pick_rows 不可用）时的贪心填法，按 len(row) 累加、不算换行符
     keep: list[str] = []
     dropped: list[str] = []
+    used = 0
     for r in rows:
-        if sum(len(x) for x in keep) + len(r) > budget:
+        if used + len(r) > budget:
             dropped.append(r)
         else:
             keep.append(r)
+            used += len(r)
     return dropped
 
 
@@ -226,7 +244,7 @@ def check_domain_budgets(mem_dir: Path) -> list[str]:
         total = sum(len(r) for r in rows)
         if total <= budget:
             continue
-        dropped = _would_drop(rows, budget)
+        dropped = _would_drop(rows, budget, loader)
         names = []
         for r in dropped[:3]:
             m = re.search(r"^-\s*\[([^\]]+)\]", r.strip())
@@ -235,14 +253,16 @@ def check_domain_budgets(mem_dir: Path) -> list[str]:
             f"**DOMAIN_INDEX_OVER_BUDGET · `{did}`**："
             f"_index_{did}.md 共 {len(rows)} 条 / {total:,} cp，"
             f"超 loader 的 MAX_DOMAIN_CP={budget:,}，"
-            f"做这类任务时**最后 {len(dropped)} 条注不进上下文**"
-            + ("（" + "、".join(names) + ("…" if len(dropped) > 3 else "") + "）" if names else "")
+            f"做这类任务时**有 {len(dropped)} 条注不进上下文**"
+            + ("（与提问完全不沾边时会被丢的是：" + "、".join(names)
+               + ("…" if len(dropped) > 3 else "") + "）" if names else "")
         )
 
     if problems:
         problems.append(
-            "→ loader 是**从尾部截断**的，而新教训一律追加在末尾——"
-            "所以被丢的永远是最新写的那几条。"
+            "→ loader 超预算时**按与当次提问的相关性挑**（2026-09-08 起）。"
+            "所以**丢几条是定的、丢哪几条取决于你问什么**——"
+            "上面点名的那几条只是「零信号时」的样子，别当成固定名单。"
             "先做便宜的：压缩该域最长的几行索引（索引行只是「什么情况下你需要我」，"
             "不是摘要正文），或把过大的域拆成两个。"
             "**别直接调大 MAX_DOMAIN_CP**——它跨所有项目生效，属取舍、该用户定。"
@@ -659,7 +679,7 @@ def _selftest() -> int:
             # 我这边 regex 立刻 got=None、整条锚静默失效）。措辞是会变的，
             # 「注进去了几行」是行为、不会变——**对着行为写判据，别对着话术写**。
             rows = _index_rows((bdir / "_index_ppt.md").read_text(encoding="utf-8"))
-            mine = len(_would_drop(rows, MAXD))
+            mine = len(_would_drop(rows, MAXD, loader))
             doms_l = [{"id": "ppt", "label": "x", "keywords": ["ppt"]}]
             # loader 读的是 <cwd>/.claude/memory/，造一份同内容的给它
             lm = tmp / "lproj" / ".claude" / "memory"
@@ -669,6 +689,24 @@ def _selftest() -> int:
             blk = loader.build_block(tmp / "lproj", ["ppt"], doms_l) or ""
             listed = len(_index_rows(blk))
             check("丢的条数与 loader 实际截断一致", len(rows) - listed == mine, True)
+
+            # ⚠️ 上面那条只喂了**零信号**（build_block 不传 prompt），而 loader
+            # 2026-09-08 起是「按相关性挑」——零信号下新旧实现等价，于是这条锚
+            # **对算法换代完全无感**（初版抄了一份旧循环，这条锚照样全绿，
+            # 而报文里「最后 N 条」「从尾部截断」已经全错了）。补两条：
+            #   ① 非零信号下条数仍要对得上；② 丢的**是哪几条**也要对得上。
+            # 这才叫「对着行为写判据」——只对条数、不对集合，同样会漏。
+            probe = "ppt 幻灯 t29 t28"
+            blk_p = loader.build_block(tmp / "lproj", ["ppt"], doms_l, probe) or ""
+            check("丢的条数在**非零信号**下也与 loader 一致",
+                  len(rows) - len(_index_rows(blk_p)) == mine, True)
+            kept0 = set(_index_rows(loader.build_block(
+                tmp / "lproj", ["ppt"], doms_l, "") or ""))
+            check("丢的**是哪几条**与 loader 零信号逐条一致",
+                  set(_would_drop(rows, MAXD, loader)) == set(rows) - kept0, True)
+            check("报文不再说死「最后 N 条」/「从尾部截断」",
+                  any(("最后" in x and "条注不进" in x) or "从尾部截断" in x
+                      for x in check_domain_budgets(bdir)), False)
 
             # 阴性对照②：正好卡在预算上不报（边界是 > 不是 >=）
             (bdir / "_index_git.md").write_text("- [x](x.md) — " + "长" * (MAXD - 14) + "\n",
