@@ -310,8 +310,9 @@ fi
 # ── 6. 只能你自己在本地 VS Code 里确认的（容器内看不到）──────────────────
 head_ "6) 容器内查不到的两项（存在你本地电脑上）"
 printf '  %s· Bypass permissions 总开关：VS Code 设置搜 "dangerously skip"，\n' "$D"
-printf '    必须勾在 %sUser%s 标签页（跟你这台电脑走、对所有项目生效），\n' "$N$D" "$D"
-printf '    勾在 Remote/Workspace 就只对当前容器/当前项目成立。\n'
+printf '    在容器/远程窗口里必须勾 %sRemote [Dev Container]%s 标签页——\n' "$N$D" "$D"
+printf '    这个键是 machine 作用域，勾 User 标签页在容器窗口里读不到、不生效。\n'
+printf '    代价：它落在容器盘上，%s重建容器后要重勾一次%s。\n' "$N$D" "$D"
 printf '    与上面第 3 节的 defaultMode 是%s一对%s、缺一不可：defaultMode 决定\n' "$N$D" "$D"
 printf '    「新会话起步在哪个模式」（跟 dotfiles 走、换容器还在），这个 toggle\n'
 printf '    决定「这台电脑上允不允许出现该模式」。agent 无权代勾——那属自我授权。\n'
