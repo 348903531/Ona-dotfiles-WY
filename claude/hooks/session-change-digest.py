@@ -115,8 +115,66 @@ ACTION_LABELS = [
     ("move", "移动/复制文件"),
     ("script_write", "脚本内写了文件"),
 ]
-UPLOAD_RE = re.compile(
-    r"MediaFileUpload|files\(\)\.create\(|files\(\)\.update\(|drive[_-]?upload|\bupload\b")
+# 前四个是明确的 Drive 上传形态。第五个 `\bupload\b` 是给 `gws drive upload x`、
+# `python3 upload_to_drive.py` 这类命令名/子命令形态兜底——但它**太宽**：
+# 2026-08-28 实测，一批文献 PDF 放在 `/tmp/upload/` 目录下，光是读这些文件就让本 hook
+# 报出「上传到 Drive ×4」，而那一轮**零 Drive 操作**。
+# **为什么这个误报必须修**：对账清单是「不再逐次弹窗确认」之后唯一的补偿（卡 #27）。
+# 它谎报外发行为，用户就会开始忽略整张清单——那时真正的外发会藏在噪音里。
+# 收紧方式：`upload` 作为**路径片段**（前后被 `/` 包住，如 `/tmp/upload/x.pdf`）时不算，
+# 除非同一条命令里另有 drive/gdrive/gws/google 语境。其余四个形态不受影响。
+# ── Drive 上传判据（2026-08-28 第三版：换维度，不再加豁免）───────────────────
+#
+# 前两版都栽在同一件事上：拿**裸单词 `upload`** 当信号。它命中的净是字符串字面量——
+#   第一版误报：`/tmp/upload/x.pdf` 目录名（读文献 PDF 被记成「上传到 Drive ×4」）
+#   第二版误报：`fix/digest-upload-false-positive` 分支名（修误报的分支名本身触发误报）
+#   第三版发现：`grep -E "upload 判据"`、`echo "...upload 相关用例..."`——
+#              **修这个误报的过程本身，又触发了这个误报**
+# 每版都是「再加一条豁免」，于是每版都冒出新形态。**打地鼠说明判据维度选错了。**
+#
+# 这与本 hook 早年那次修复同源：危险命令判定第一版也用正则扫全文，连踩三轮，
+# 最后换成 shlex 词法分析才终结（见下面 SEPARATORS 处的注释）。同一个教训，
+# upload/send 这两条当年被留在了「文本级近似」档，没跟着换维度——债现在还上。
+#
+# **新判据：不再把「出现了 upload 这个词」当信号，只认明确的上传形态。**
+# ① 库调用/脚本名层面无歧义的写法（MediaFileUpload / files().create( / upload_to_drive）
+# ② 命令形态：Drive/云盘工具 + 传输动作（gws drive upload / rclone copy / gsutil cp）
+# 两者都不看"有没有 upload 这个词"，所以 grep 模式串、分支名、目录名一律不再命中。
+#
+# 漏报侧怎么兜：真正的上传要么用 ①（Python 侧），要么用 ②（CLI 侧）。
+# 若将来出现新的上传 CLI，把它加进 _UPLOAD_TOOL 一行即可——
+# **枚举"什么算上传"是收敛的，枚举"什么不算"是发散的**，这正是换维度的理由。
+_UPLOAD_API = re.compile(
+    r"MediaFileUpload"                       # google-api-python-client 的上传对象
+    r"|files\(\)\.create\(|files\(\)\.update\("   # Drive v3 落盘调用
+    r"|drive[_-]?upload|upload[_-]?to[_-]?drive"  # 本仓/常见脚本名（两种词序都收）
+    r"|safe_update\(",                       # 本仓 safe_drive.py 的受守卫覆盖入口
+)
+# 云盘/对象存储 CLI + 传输子命令：两者都出现才算（单独一个 cp 显然不是）
+_UPLOAD_TOOL = re.compile(r"\b(?:gws|rclone|gsutil|aws|gdrive|drive)\b", re.I)
+_UPLOAD_VERB = re.compile(r"\b(?:upload|copyto|copy|cp|sync|put|mv)\b", re.I)
+_DRIVE_CTX_RE = re.compile(r"drive|gdrive|\bgws\b|google|云盘|网盘", re.I)
+
+
+def _is_upload(cmd):
+    """这条命令是不是真的在往 Drive / 云盘传东西。
+
+    刻意**不**看「有没有 upload 这个词」——那是前两版误报的根源。
+    只认两类明确形态；判不准时宁可漏报由 send/pr 等其它分类兜，也不谎报外发
+    （谎报会让用户开始忽略整张对账清单，那时真外发就藏进噪音里了）。
+    """
+    if _UPLOAD_API.search(cmd):
+        return True
+    # CLI 形态：必须同时有云盘工具名和传输动作词，且整体处在 Drive 语境里
+    if (_UPLOAD_TOOL.search(cmd) and _UPLOAD_VERB.search(cmd)
+            and _DRIVE_CTX_RE.search(cmd)):
+        return True
+    return False
+
+
+# 保留旧名供既有调用点/测试引用（判据已收敛进 _is_upload，此处只作兼容别名）
+UPLOAD_RE = _UPLOAD_API
+
 SEND_RE = re.compile(
     r"gmail[_-]?(?:send|compose)|messages\(\)\.send|spaces\(\)\.messages"
     r"|chat[_-]?send|send[_-]?mail|smtplib")
@@ -327,6 +385,69 @@ def _script_writes_file(cmd, head):
     return bool(SCRIPT_WRITE_RE.search(cmd))
 
 
+# ── upload 的 AST 分支：与 _python_writes_file 同一套路子 ────────────────────
+# 为什么需要它（2026-08-28，同一天第三次改 upload 判据）：文本判据分不清
+# 「代码**调用**了上传」和「代码里的**字符串**提到了 upload」。实测残留的 4 条误报
+# 全是这一种——`python3 -c "...'gws drive upload x'..."`，那是**测试夹具字符串**。
+# AST 里字符串字面量是 ast.Constant，永远不会变成 ast.Call，天然区分开。
+# 精确函数名，**不做子串匹配**。曾用 `"upload" in name` 收得太宽——
+# `_is_upload()` 这种**判定**函数也含 upload，AST 分不出「上传」与「判断是否上传」，
+# 于是 agent 调试本判据时自己触发自己（2026-08-28 实测残留的最后 1 条误报）。
+# 枚举「什么算上传」是收敛的，靠子串猜是发散的——与本次换维度同一条理由。
+_UPLOAD_CALL_NAMES = {
+    "MediaFileUpload", "safe_update",
+    "upload", "upload_file", "upload_files",
+    "upload_to_drive", "drive_upload", "upload_bytes",
+}
+
+
+def _python_uploads(src):
+    """AST 判定：这段 python 代码里有没有**真的调用**上传。解析失败返回 None。"""
+    try:
+        tree = ast.parse(src)
+    except (SyntaxError, ValueError):
+        return None                       # 交给调用方退回文本判据
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        f = node.func
+        name = ""
+        if isinstance(f, ast.Name):
+            name = f.id
+        elif isinstance(f, ast.Attribute):
+            name = f.attr
+        if name in _UPLOAD_CALL_NAMES:
+            return True
+        # svc.files().create(...) / .update(...) —— Drive v3 的落盘调用
+        if name in ("create", "update") and isinstance(f, ast.Attribute):
+            inner = f.value
+            if (isinstance(inner, ast.Call) and isinstance(inner.func, ast.Attribute)
+                    and inner.func.attr == "files"):
+                return True
+    return False
+
+
+def _script_uploads(cmd, head):
+    """段首是 python 时优先 AST；其余或解析失败时退回文本判据。
+
+    已知边界（2026-08-28 查清，刻意不修）：`_extract_script_source` 对嵌套引号很深的
+    `python3 -c "..."` 只能截到片段，AST 会以 unterminated string literal 解析失败，
+    于是退回文本判据 —— 代码里的**测试夹具字符串**仍会被判成上传。
+    实测本会话 199 条真实命令里残留这 1 条，且它出现的唯一场景是
+    「agent 正在调试本判据自己」，正常干活遇不到。
+    不修的两个理由：① 解析失败时改成直接返回 False 会牺牲漏报安全，
+    而漏报比误报危险（账本漏记用户发现不了）；② 改 `_extract_script_source`
+    会同时影响 `_python_writes_file`，为一个极低频场景把风险扩散到另一条判据上不划算。
+    """
+    if head in ("python", "python3"):
+        src = _extract_script_source(cmd)
+        if src is not None:
+            verdict = _python_uploads(src)
+            if verdict is not None:
+                return verdict            # AST 说了算，测试夹具字符串不会误伤
+    return _is_upload(cmd)
+
+
 def _command_units(cmd):
     """把 shell 文本切成处于命令位置的 [(head, args), …]。解析失败返回 None。"""
     try:
@@ -425,7 +546,7 @@ def _classify(cmd):
             hits.add("move")
         elif head in CODE_ARG_HEADS:
             # 参数即代码 → 只能文本级近似（上传/外发都是 API 调用，藏在代码里）
-            if UPLOAD_RE.search(joined):
+            if _script_uploads(joined, head):
                 hits.add("upload")
             if SEND_RE.search(joined):
                 hits.add("send")
@@ -433,7 +554,7 @@ def _classify(cmd):
             # python 走 AST 真解析，解析不了才退回正则（见 _python_writes_file）。
             if _script_writes_file(cmd, head):
                 hits.add("script_write")
-        if UPLOAD_RE.search(joined) and head in ("gws", "rclone", "gsutil", "aws"):
+        if _is_upload(joined) and head in ("gws", "rclone", "gsutil", "aws"):
             hits.add("upload")
     # 破坏性：单一事实源（含安全区豁免），与弹窗闸门永远同一结论
     if _DESTRUCTIVE_SCAN:
@@ -723,6 +844,28 @@ def _selftest():
     want("feat/xyz" in out, "push 分支被提取")
     want_destructive("⚠️ 破坏性操作" in out, "reset --hard 被标为破坏性")
     want("上传到 Drive" in out, "Drive 上传被收进外发")
+
+    # ── upload 判据的两侧回归（2026-08-28 真实误报）────────────────────────
+    # 病灶：`\bupload\b` 命中了**目录名**——一批文献 PDF 放在 /tmp/upload/ 下，
+    # 光是读它们就报出「上传到 Drive ×4」，而那一轮零 Drive 操作。
+    # 为什么必须修：对账清单是「不再逐次弹窗确认」之后唯一的补偿（卡 #27）。
+    # 它谎报外发，用户就会开始忽略整张清单——那时真正的外发会藏在噪音里。
+    # **两侧都测**：不该报的必须静默，该报的一个都不能漏（漏记比误报更危险）。
+    for _cmd, _want, _desc in [
+        ('python3 gate.py /tmp/upload/22_Gao_BMCCancer.pdf', False, '路径 /tmp/upload/ 不误报'),
+        ('for f in /tmp/upload/*.pdf; do check $f; done', False, '循环遍历该目录不误报'),
+        ('ls ~/uploads/notes.txt', False, '复数目录名不误报'),
+        ('gws drive upload report.md --folder abc', True, 'gws drive upload 仍被抓'),
+        ('python3 -c "MediaFileUpload(p)"', True, 'MediaFileUpload 仍被抓'),
+        ('python3 tools/upload_to_drive.py report.md', True, '上传脚本名仍被抓'),
+        ('python3 -c "svc.files().create(body=b)"', True, 'files().create 仍被抓'),
+        ('gws drive upload /tmp/upload/x.pdf', True, '路径+真上传混合时仍被抓'),
+        ('git push -u origin fix/digest-upload-false-positive', False, 'git 分支名含该词不误报'),
+        ('git checkout -b fix/upload-guard', False, 'checkout 分支名不误报'),
+        ('gh pr create --head feat/upload-fix', False, 'gh 命令分支名不误报'),
+        ('git push origin main && gws drive upload r.md', True, 'git 开头但真有 Drive 传输时仍被抓'),
+    ]:
+        want(_is_upload(_cmd) == _want, f"upload 判据：{_desc}")
     want(last == 10, "读到的行数 = 10（供增量节流用）")
 
     # 增量：从 last 再扫一次，应无新增 → 空清单（防重复报同一批改动）

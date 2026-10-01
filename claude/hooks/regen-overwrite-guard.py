@@ -84,10 +84,52 @@ UPLOAD_RE = re.compile(
 )
 ARTIFACT_RE = re.compile(r"\.pptx\b|\.docx\b|\.xlsx\b|\.pdf\b", re.I)
 
+# 交付动作识别的单一事实源（含 wrapper 盲点补丁，见该模块 docstring）。
+# 防御性 import：模块丢了就退化成纯命令串判定，hook 照常工作、不崩。
+try:
+    import sys as _sys_dc
+
+    _sys_dc.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    import _delivery_cmd as _dc
+except Exception:
+    _dc = None
+
 # ── B：本会话由本地脚本重新生成 ──────────────────────────────────────
+#
+# ⚠️ 2026-09 换引擎后补的两个洞（本仓 10 个产片技能的出片引擎换成上游 ppt-master 之后，
+#    模拟交付验证当场测出：新链路产的片，本闸门**一次都不响**）。两个原因各自独立、
+#    各自都足以让判据失灵：
+#
+#  ① **脚本名不在词表里**。旧链路叫 `build_editable_pptx.py` / `build_onepage.py` /
+#     `condense_deck.py`（都命中 build|make|gen|…），这批已随换引擎退役删除；新链路
+#     出片走引擎的 `svg_to_pptx.py`——不含 build/make/gen/render/create 任一词根。
+#  ② **解释器不是字面 `python3`**。技能文档里的真实写法是
+#     `$PY $E/scripts/svg_to_pptx.py <proj> -o <proj>/exports/xx.pptx` 与
+#     `(cd "$ENG" && "$VP" scripts/svg_to_pptx.py "$PROJ" -o "$OUT")`——
+#     用的是 `$PY` / `"$VP"` 变量或 venv 路径，`python3?\s+` 这一段直接匹配不上。
+#
+# 所以这里做两件事：把解释器放宽成「python / venv 路径 / $变量 / uv run」，
+# 并把引擎的出片脚本按名收进来。**新加的两段都刻意要求解释器前缀**——本 regex 只在
+# tool_use 里 name=Bash 的 `command` 上跑（见 _scan），但 `cat build_report.py`、
+# `ls scripts/ | grep build_deck.py` 这类**读**命令同样出现在 command 字段里，
+# 不要解释器前缀就会把它们误判成「重新生成过」。要求解释器前缀 = 要求执行形态。
+#
+# ⚠️ 已知残留误报，**查清了、刻意不修**（不是没查）：中间那段
+# `\bbuild_deck\.py|\bbuild_pptx\.py|\bmake_deck\.py` 是历史遗留的**裸文件名**分支，
+# 不要求解释器，于是 `cat scripts/build_deck.py` 也会被判成「重新生成过」。
+# 不修的理由：① 要修就得同时兼容 `./build_deck.py`、`make deck` 这类不带 python
+# 字样的执行形态，收紧容易顺手砍掉真检出；② 误报方向是**保守**的——多要求你下载线上
+# 那份比对一次，与本闸门 docstring 里「首次上传全新文件也一并拦下，这是刻意的保守」
+# 同一取向，且有 REGEN_OVERWRITE_GUARD_SKIP=1 逃生阀。
+# .test.sh 里留了对应用例，把这条行为钉成**已知的**，免得下次有人当成新 bug 重查一遍。
+_INTERP = r"(?:\"?\$[A-Za-z_]\w*\"?|[\w./~-]*(?:bin/)?python3?|uv\s+run)"
 REGEN_CMD_RE = re.compile(
-    r"python3?\s+[^\n]*\b(?:build|make|gen|generate|render|create)[_-]?\w*\.py"
-    r"|\bbuild_deck\.py|\bbuild_pptx\.py|\bmake_deck\.py",
+    rf"{_INTERP}\s+[^\n]*\b(?:build|make|gen|generate|render|create)[_-]?\w*\.py"
+    r"|\bbuild_deck\.py|\bbuild_pptx\.py|\bmake_deck\.py"
+    # 上游 ppt-master 引擎：出片（写出 .pptx）的那一步。pptx_to_svg.py 刻意**不收**
+    # ——它是「把现成 deck 拆成 SVG」的入料步，本身不产成品；而若那份现成 deck 是从
+    # 线上下载来的，COMPARED_RE 会认到 get_media，本就该放行。
+    rf"|{_INTERP}\s+[^\n]{{0,200}}?\bsvg_to_pptx\.py",
     re.I,
 )
 GENERATOR_FILE_RE = re.compile(
@@ -177,7 +219,15 @@ def main():
     if payload.get("tool_name") != "Bash":
         return 0
     cmd = (payload.get("tool_input") or {}).get("command") or ""
-    if not (UPLOAD_RE.search(cmd) and ARTIFACT_RE.search(cmd)):
+    # wrapper 盲点补丁（2026-09-08 事故）：命令被包进脚本时（`python3 upload.py`），
+    # 判据全在文件里、命令串上一个字没有，本闸门会静默放行。本 hook 尤其该补——
+    # 它守的正是卡 #33「重新生成整份再覆盖线上文件」，与那次事故形态完全一致。
+    # 判定收进 _delivery_cmd 共用一份；模块缺失时退化成原来的纯命令串判定。
+    _hit_a = (_dc.is_delivery_command(
+        "Bash", payload.get("tool_input") or {}, UPLOAD_RE, ARTIFACT_RE)
+        if _dc is not None
+        else bool(UPLOAD_RE.search(cmd) and ARTIFACT_RE.search(cmd)))
+    if not _hit_a:
         return 0
     tp = payload.get("transcript_path")
     if not tp or not os.path.exists(tp):

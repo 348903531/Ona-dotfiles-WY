@@ -84,6 +84,18 @@
             "command": "GUARD=\"$HOME/.claude/hooks/regen-overwrite-guard.py\"; [ -f \"$GUARD\" ] && python3 \"$GUARD\" || exit 0"
           }
         ]
+      },
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "id": "git-stash-guard",
+            "type": "command",
+            "command": "GUARD=\"$HOME/.claude/hooks/git-stash-guard.py\"; [ -f \"$GUARD\" ] && python3 \"$GUARD\" || exit 0"
+          }
+        ],
+        "description": "git stash guard (user-level, deny)：拦下会改 stash 栈的 git stash（裸 stash / push / pop / apply / drop / clear…）。stash 栈存在 .git/refs/stash、所有 worktree 共用，并行会话会互相取走对方的在制品且两边都不报错——2026-10-01 同日两起。为什么跨项目装：任何仓库只要开了多个会话或 worktree 就会撞，不是 WY-workspace-P 专属。用 deny 不用 ask：agent 自己能换做法（旧版本整套复制到 /tmp / git worktree add / 提交到临时分支），弹给用户只会得到 yes。list/show/create 放行；shlex 按 token 切，引号里的字样不误拦。源在 WY-workspace-P/.claude/hooks/，sync-hooks.sh 同步。逃生阀见脚本 --help。",
+        "id": "pretooluse:git-stash-guard"
       }
     ],
     "Stop": [
