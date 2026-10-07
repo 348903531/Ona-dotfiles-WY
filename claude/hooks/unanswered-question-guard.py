@@ -47,7 +47,16 @@
 
 1. **只抽取、不判对错**。它不知道你答没答，只负责让「我忘了」这个借口不成立。
 2. **中文启发式**，不是语法分析。反问句（「这不是很明显吗」）会被当成问题——宁可多列。
-3. **只看最后一条真实用户消息**。system-reminder、tool_result、斜杠命令都跳过。
+3. **看「这一轮」的全部用户消息**：最后一条真实用户消息 + 它之后在我干活中途补发的
+   消息（transcript里是 `attachment.type == queued_command` 的另一种格式）。
+   system-reminder、tool_result、斜杠命令、上下文压缩摘要都跳过。
+
+   **为什么要单独读中途补发的消息（2026-10-07 用户点名后补）**：用户在长任务中途
+   追问、补充指令，是最自然的协作方式；而这类消息**不是 `type == user` 的行**，
+   初版只读 user 行，于是它们对本 hook 完全不可见——一个会话里 10 条中途消息
+   一条都没被列出来，其中两个问题连漏两轮，用户第三次来问。同轮第二个缺陷：
+   上下文压缩后的摘要（`isCompactSummary`）是 type=user，被当成「用户最新消息」，
+   把好几轮前早已答过的问题列成 11 条噪音。两处都按实物字段修，见 collect()。
 4. **不 block**。exit 0 + additionalContext，agent 可据此补答。
 
 输入：stdin JSON（session_id / transcript_path）。
@@ -151,6 +160,9 @@ def _msg_text(entry):
     # 5 条真实用户消息两者皆无，零重叠。两个都查是双保险（不同注入源可能只带其一）。
     if entry.get("isMeta") or entry.get("sourceToolUseID"):
         return None
+    # 上下文压缩摘要也是 type=user，但它是系统写的旧轮次回顾，不是用户这轮说的话。
+    if entry.get("isCompactSummary") or entry.get("isVisibleInTranscriptOnly"):
+        return None
     msg = entry.get("message") or {}
     if msg.get("role") != "user":
         return None
@@ -170,9 +182,36 @@ def _msg_text(entry):
     return None
 
 
+def _queued_text(entry):
+    """用户在我干活中途补发的消息（queued_command 附件）；不是则返回 None。
+
+    判据取自实物（2026-10-07 本会话 transcript 逐条核过）：12 条 queued_command 里
+    10 条是真人补发（commandMode=prompt、origin.kind=human、humanTurn=True），
+    另 2 条是后台任务完成通知（commandMode=task-notification），必须排除。
+    """
+    if entry.get("type") != "attachment":
+        return None
+    a = entry.get("attachment") or {}
+    if a.get("type") != "queued_command" or a.get("commandMode") != "prompt":
+        return None
+    if (a.get("origin") or {}).get("kind") != "human":
+        return None
+    pr = a.get("prompt")
+    if isinstance(pr, str):
+        return pr
+    if isinstance(pr, list):
+        return "\n".join((c.get("text") or "") for c in pr
+                         if isinstance(c, dict) and c.get("type") == "text") or None
+    return None
+
+
 def collect(transcript_path):
-    """返回 (最后一条用户消息的问题清单, 更早消息里出现过的问题指纹集合)。"""
-    users = []
+    """返回 (这一轮的问题清单, 更早消息里出现过的问题指纹集合)。
+
+    这一轮 = 最后一条真实用户消息 + 它之后中途补发的消息。清单元素为
+    (句子, 是否带问号, 是否中途补发)。
+    """
+    msgs = []                       # [(text, is_queued)]
     try:
         with open(transcript_path, encoding="utf-8") as fh:
             for line in fh:
@@ -183,21 +222,29 @@ def collect(transcript_path):
                     entry = json.loads(line)
                 except Exception:
                     continue
+                queued = False
                 t = _msg_text(entry)
+                if t is None:
+                    t = _queued_text(entry)
+                    queued = t is not None
                 if t is None:
                     continue
                 t = _strip_noise(t).strip()
                 if not t or t.startswith("/"):     # 斜杠命令不算提问
                     continue
-                users.append(t)
+                msgs.append((t, queued))
     except Exception:
         return [], set()
-    if not users:
+    prompts = [k for k, (_t, q) in enumerate(msgs) if not q]
+    if not prompts:
         return [], set()
+    start = prompts[-1]
 
-    latest = extract_questions(users[-1])
+    latest = []
+    for t, q in msgs[start:]:
+        latest.extend((s, qm, q) for s, qm in extract_questions(t))
     earlier = set()
-    for t in users[:-1]:
+    for t, _q in msgs[:start]:
         for s, _ in extract_questions(t):
             earlier.add(_fingerprint(s))
     return latest, earlier
@@ -211,16 +258,22 @@ def _fingerprint(s):
 def render(questions, earlier):
     if len(questions) < MIN_QUESTIONS:
         return ""
-    lines = ["🙋 **用户这条消息里提了 %d 个问题**——发送前逐条点手指，"
+    lines = ["🙋 **用户这一轮提了 %d 个问题（含干活中途补发的）**——发送前逐条点手指，"
              "别在表格/长段落里顺带带过（那等于没答）：" % len(questions), ""]
     shown = questions[:MAX_LISTED]
-    for i, (s, has_qmark) in enumerate(shown, 1):
+    for i, q in enumerate(shown, 1):
+        s, has_qmark = q[0], q[1]
+        mid = len(q) > 2 and q[2]
         body = s if len(s) <= MAX_LEN else s[:MAX_LEN] + "…"
         mark = "🔁 " if _fingerprint(s) in earlier else ("" if has_qmark else "· 无问号 ")
-        lines.append("%d. %s%s" % (i, mark, body))
+        lines.append("%d. %s%s%s" % (i, "⏳ 中途补发 · " if mid else "", mark, body))
     if len(questions) > MAX_LISTED:
         lines.append("…另有 %d 条未列出，回读原消息。" % (len(questions) - MAX_LISTED))
-    if any(_fingerprint(s) in earlier for s, _ in shown):
+    if any(q[2] for q in shown if len(q) > 2):
+        lines.append("")
+        lines.append("⏳ = **用户在你干活中途补发的**。它们和这一轮的提问是一个整体，"
+                     "最终回复里要逐条答到；还没答完的，列成回复的第一节。")
+    if any(_fingerprint(q[0]) in earlier for q in shown):
         lines.append("")
         lines.append("🔁 = **之前问过、这次又问了一遍**，说明上次就漏了——优先答这条。")
     lines.append("")
@@ -251,7 +304,7 @@ def main():
     try:
         os.makedirs(CACHE_DIR, exist_ok=True)
         key = hashlib.sha1(
-            (session_id + "|" + "|".join(q for q, _ in questions)).encode("utf-8")
+            (session_id + "|" + "|".join(q[0] for q in questions)).encode("utf-8")
         ).hexdigest()
         stamp = os.path.join(CACHE_DIR, key)
         if os.path.exists(stamp):
@@ -338,8 +391,8 @@ def _selftest():
             fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
     qs2, earlier2 = collect(path)
     want(len(qs2) == 2, "只抽最后一条真实用户消息的 2 个问题（实抽 %d）" % len(qs2))
-    want(all("重试" not in q for q, _ in qs2), "tool_result 里的问句没被误抽")
-    want(all("闸门" not in q for q, _ in qs2), "system-reminder 里的问句没被误抽")
+    want(all("重试" not in q[0] for q in qs2), "tool_result 里的问句没被误抽")
+    want(all("闸门" not in q[0] for q in qs2), "system-reminder 里的问句没被误抽")
     os.unlink(path)
 
     # 5b) Skill / slash-command 注入的正文**不得**被当成用户提问。
@@ -366,11 +419,40 @@ def _selftest():
             fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
     qs3, _e3 = collect(path3)
     want(len(qs3) == 2, "skill 注入被排除后，只抽真实用户消息的 2 个问题（实抽 %d）" % len(qs3))
-    want(all("场景" not in q and "教训" not in q for q, _ in qs3),
+    want(all("场景" not in q[0] and "教训" not in q[0] for q in qs3),
          "isMeta 注入（skill 正文）里的问句没被误抽")
-    want(all("闸门" not in q and "skill" not in q for q, _ in qs3),
+    want(all("闸门" not in q[0] and "skill" not in q[0] for q in qs3),
          "带 sourceToolUseID 的注入里的问句没被误抽")
     os.unlink(path3)
+
+
+    # 5c) 中途补发的消息必须列进来、压缩摘要必须排除（2026-10-07 真实事故复刻）。
+    #     **中途消息放在最后、摘要放在真实消息之后**——否则判据失效也测不出来（同 5b）。
+    fd4, path4 = tempfile.mkstemp(suffix=".jsonl")
+    with os.fdopen(fd4, "w", encoding="utf-8") as fh:
+        for rec in [
+            {"type": "user", "message": {"role": "user",
+                "content": "以前问过的：报告放哪里了？还缺什么吗？"}},
+            {"type": "user", "message": {"role": "user",
+                "content": "帮我把草稿填好保存。另外检查一下作者顺序。"}},
+            {"type": "user", "isCompactSummary": True, "isVisibleInTranscriptOnly": True,
+             "message": {"role": "user", "content": "摘要：用户问过报告放哪里了？还缺什么吗？"}},
+            {"type": "attachment", "attachment": {"type": "queued_command",
+             "commandMode": "task-notification", "origin": {"kind": "task-notification"},
+             "prompt": "<task-notification>任务完成了吗？要不要看？</task-notification>"}},
+            {"type": "attachment", "attachment": {"type": "queued_command",
+             "commandMode": "prompt", "origin": {"kind": "human"}, "humanTurn": True,
+             "prompt": [{"type": "image"}, {"type": "text",
+                 "text": "只写图注没放图算不算错误？修订版最后交不交？"}]}},
+        ]:
+            fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
+    qs4, _e4 = collect(path4)
+    want(any("图注" in q[0] and q[2] for q in qs4), "中途补发的问题被列出且标为中途（实抽 %d 条）" % len(qs4))
+    want(any("作者顺序" in q[0] for q in qs4), "这一轮的原始提问仍在")
+    want(all("报告放哪里" not in q[0] for q in qs4), "压缩摘要没被当成用户最新消息")
+    want(all("任务完成" not in q[0] for q in qs4), "后台任务通知没被当成用户提问")
+    want("⏳" in render(qs4, set()), "渲染时给中途补发的问题打 ⏳")
+    os.unlink(path4)
 
     # 6) 坏输入：文件不存在 / 空文件 → 静默且不抛异常
     want(collect("/nonexistent/xx.jsonl") == ([], set()), "坏输入：文件不存在 → 静默")
