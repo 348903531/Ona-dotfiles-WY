@@ -736,6 +736,15 @@ A'Hern写。用户下一轮：「**这个我不是说了吗？用Simon两阶段�
 **推论**:同族入口按生态选——GitHub项目用 `gh api search/issues`(免搜索引擎、可按`state`/
 `sort=updated`筛)、npm/pypi包看其仓库issue、商业SaaS看status page与release notes。
 
+**推论二（2026-10-08，社区群通知印证）：罗氏环境里的工具问题，先查社区应用市场再动手。**
+Ona / build-cli / Claude Code在罗氏网络里撞的墙（WebSearch报 `restricted by VPCSC`、
+某平台读不了、某API要换通道）多半**别人已经撞过并做了轮子**。顺序：① 本仓 `demos/` 与
+`.claude/skills/` 里grep（社区的demo常已同步进来）→ ② 社区应用市场
+`https://silicon-hitchhiker.aws.cloud.roche.com/products/`（源码在你的fork
+`wangy548_roche/silicon-hitchhiker` 的 `demos/` 与 `apps/community-site/web/src/content/catalog/`）
+→ ③ 都没有才自己造。实例：WebSearch被VPCSC挡，社区 `demos/web-search`（Tavily + 豆包搜索）
+早就有，本仓也早已接入——不查就会再造一遍。
+
 ## Git习惯
 
 - 开新分支前先把main拉到最新；提PR前再rebase一次，不在过期main上长期开发。
