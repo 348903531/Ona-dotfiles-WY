@@ -740,7 +740,7 @@ A'Hern写。用户下一轮：「**这个我不是说了吗？用Simon两阶段�
 Ona / build-cli / Claude Code在罗氏网络里撞的墙（WebSearch报 `restricted by VPCSC`、
 某平台读不了、某API要换通道）多半**别人已经撞过并做了轮子**。顺序：① 本仓 `demos/` 与
 `.claude/skills/` 里grep（社区的demo常已同步进来）→ ② 社区应用市场
-`https://silicon-hitchhiker.aws.cloud.roche.com/products/`（源码在你的fork
+`https://silicon-hitchhiker.aws.cloud.roche.com/marketplace/`（2026-10-12 起的新地址，旧的 /products/ 会自动跳转；源码在你的fork
 `wangy548_roche/silicon-hitchhiker` 的 `demos/` 与 `apps/community-site/web/src/content/catalog/`）
 → ③ 都没有才自己造。实例：WebSearch被VPCSC挡，社区 `demos/web-search`（Tavily + 豆包搜索）
 早就有，本仓也早已接入——不查就会再造一遍。
