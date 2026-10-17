@@ -122,6 +122,17 @@
         "id": "stop:unanswered-question-guard"
       },
       {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "GUARD=\"$HOME/.claude/hooks/reply-language-guard.py\"; [ -f \"$GUARD\" ] && python3 \"$GUARD\" || exit 0"
+          }
+        ],
+        "description": "Reply-language guard (user-level): 用户用中文跟我说话，而我这一轮写给用户的正文里有整段英文（累计 ≥150 个字母，已剔除代码、链接、路径、引文原句、含中文格的表格行）→ block，让我当场用中文重说一遍。2026-10-17 一个跑了一整天的会话被压缩几次后，好几轮回复整段变成英文，用户只好专门说「你用中文再帮我回复一下」；拿本机 12 份真实会话做基线，另有 3 份历史会话同样有整段英文进度说明，偏好写在提示词里管不住。判据按段不按全文比例（全文比例分不开「中文夹大量文件名」与「中文开头中间插整段英文」，实测 30% 对 32%）。用户自己写了英文/English 时整轮放过；stop_hook_active 时不再拦防死循环；fail-open。逃生阀 REPLY_LANGUAGE_GUARD_SKIP=1。",
+        "id": "stop:reply-language-guard"
+      },
+      {
         "hooks": [
           {
             "id": "unverified-claim-guard",
